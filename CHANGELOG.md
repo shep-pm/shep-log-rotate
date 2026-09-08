@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-09-08
+
+### Added
+
+- Speak protocol 8 by moving to shep-client 0.7.3
+- Read the section from dogs.toml, not shep.toml
+- Answer shep's --version and --schema probes
+
+### Fixed
+
+- Close the three findings from review
+
+
 ## [0.1.6] - 2026-09-04
 
 ### Added
