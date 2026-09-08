@@ -927,7 +927,7 @@ dependencies = [
 
 [[package]]
 name = "shep-log-rotate"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "flate2",
  "jiff",
