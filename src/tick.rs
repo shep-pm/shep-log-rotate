@@ -77,7 +77,7 @@ use crate::{
 /// lift this into a library and it starts firing, at which point the
 /// trade-off wants deciding rather than silencing.
 pub trait Daemon {
-    /// The dog's own `[dog.<name>]` section, as TOML text.
+    /// The dog's own `[<name>]` section of `dogs.toml`, as TOML text.
     ///
     /// Empty when `shep.toml` has no such section, which is the ordinary
     /// case for a dog running on its defaults.
@@ -267,7 +267,7 @@ fn times(n: usize) -> String {
 /// `.gz` an abandoned gzip leaves is the state the next pass recovers from.
 ///
 /// # Errors
-/// - [`Error::Config`] if the `[dog.<name>]` section cannot be understood.
+/// - [`Error::Config`] if the `[<name>]` section cannot be understood.
 ///   Nothing is touched in that case; the tick reads the config first for
 ///   exactly that reason.
 /// - [`Error::Connect`], [`Error::Request`] or [`Error::Protocol`] if the
@@ -297,7 +297,7 @@ pub async fn tick<D: Daemon>(
     stop: &mut Stop,
 ) -> Result<(Config, Report), Error> {
     // Named at the point of failure rather than through a `From` impl: the
-    // section is `[dog.<name>]` for whatever this dog was adopted as, and an
+    // section is `[<name>]` for whatever this dog was adopted as, and an
     // error naming some other block sends the reader to a section they never
     // wrote.
     let config =

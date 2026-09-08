@@ -131,9 +131,14 @@ impl Shepherd {
         String::from_utf8_lossy(&output.stdout).into_owned()
     }
 
-    /// Write this home's `shep.toml`.
+    /// Write this home's `dogs.toml`, where a dog's own settings live.
+    ///
+    /// Not `shep.toml`. A dog's section moved into a file of its own, and a
+    /// shepherd that finds the same dog named in both refuses to boot rather
+    /// than guess which one was meant, so a test writing the old place would
+    /// fail as a daemon that never came up.
     fn write_config(&self, body: &str) {
-        fs::write(self.home().join("shep.toml"), body).expect("shep.toml");
+        fs::write(self.home().join("dogs.toml"), body).expect("dogs.toml");
     }
 
     /// Start this dog as a plain child process, the way an operator running
@@ -141,7 +146,7 @@ impl Shepherd {
     ///
     /// Adoption is a separate question with its own tests. Nothing spawned
     /// this dog, so it gets no `$SHEP_DOG_NAME`: it announces that, connects
-    /// without naming itself, and reads `[dog.log-rotate]`, which is the
+    /// without naming itself, and reads `[log-rotate]`, which is the
     /// section these tests write. The variable is removed rather than merely
     /// left unset, because this child inherits the environment of whoever
     /// ran `cargo test`, and a developer running the suite from inside an
@@ -358,7 +363,7 @@ fn no_line_is_lost(naming: &str) {
     let sentinel = shepherd.home().join("finished");
     let script = counter_script(shepherd.home(), LINES, &sentinel);
     shepherd.write_config(&format!(
-        "[dog.log-rotate]\n\
+        "[log-rotate]\n\
          max_size = \"16K\"\n\
          keep = 5000\n\
          compress = false\n\
@@ -449,7 +454,7 @@ fn the_dog_reads_the_section_of_the_name_it_was_adopted_under() {
     let sentinel = shepherd.home().join("finished");
     let script = counter_script(shepherd.home(), 40_000, &sentinel);
     shepherd.write_config(
-        "[dog.weathervane]\n\
+        "[weathervane]\n\
          max_size = \"8K\"\n\
          keep = 5000\n\
          compress = false\n\
@@ -493,7 +498,7 @@ fn the_dog_reads_the_section_of_the_name_it_was_adopted_under() {
     assert!(
         !complaint.contains("$SHEP_DOG_NAME is not set"),
         "the dog never saw $SHEP_DOG_NAME, so it announced no name and fell back to the \
-         default section, discarding every setting in [dog.weathervane]: {complaint}"
+         default section, discarding every setting in [weathervane]: {complaint}"
     );
 
     // And it rotated at 8K rather than at the 10M default. The listing ends
@@ -506,7 +511,7 @@ fn the_dog_reads_the_section_of_the_name_it_was_adopted_under() {
         .collect();
     assert!(
         files.len() > 1,
-        "nothing rotated, so [dog.weathervane] was never read: {files:?}"
+        "nothing rotated, so [weathervane] was never read: {files:?}"
     );
     let counter = concatenated_counter(&files);
     assert_eq!(counter.first(), Some(&0));
@@ -519,13 +524,13 @@ fn adopt_puts_a_dog_in_the_listing_and_rehome_takes_it_out() {
     let shepherd = Shepherd::new();
     let idle = write_script(shepherd.home(), "idle.sh", "#!/bin/sh\nsleep 300\n");
     shepherd.write_config(
-        "[dog.weathervane]\n\
+        "[weathervane]\n\
          max_size = \"64M\"\n\
          interval = \"1h\"\n",
     );
 
     // A shepherd first, so `adopt` takes the path that starts the dog now
-    // rather than the one that only edits shep.toml.
+    // rather than the one that only edits the config files.
     shepherd.ok(&[
         "start",
         idle.to_str().expect("script path"),
@@ -557,11 +562,16 @@ fn adopt_puts_a_dog_in_the_listing_and_rehome_takes_it_out() {
             .ok(&["dogs", "--format", "json"])
             .contains("weathervane")
     });
-    let config = fs::read_to_string(shepherd.home().join("shep.toml")).expect("shep.toml");
-    assert!(
-        !config.contains("weathervane"),
-        "rehome forgets the [dog.<name>] table too: {config}"
-    );
+    // Both files: the registration in shep.toml and the dog's own section
+    // in dogs.toml. `rehome` is the verb that forgets the second one, which
+    // is what tells it apart from a plain `disable`.
+    for file in ["shep.toml", "dogs.toml"] {
+        let config = fs::read_to_string(shepherd.home().join(file)).unwrap_or_default();
+        assert!(
+            !config.contains("weathervane"),
+            "rehome forgets the [<name>] table too, and {file} still names it: {config}"
+        );
+    }
 }
 
 #[test]
@@ -619,7 +629,7 @@ fn a_generation_name_reached_through_a_symlinked_directory_is_left_alone() {
     .expect("flockfile");
 
     shepherd.write_config(
-        "[dog.log-rotate]\n\
+        "[log-rotate]\n\
          max_size = \"8K\"\n\
          keep = 5000\n\
          compress = false\n\

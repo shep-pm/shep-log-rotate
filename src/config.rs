@@ -1,8 +1,17 @@
-//! The `[dog.log-rotate]` section of `shep.toml`.
+//! The `[log-rotate]` section of `dogs.toml`.
 //!
 //! The daemon serves this per request rather than caching it, so this dog
 //! re-reads it every tick and never caches it either. Changing `max_size`
 //! should not need a `shep disable` and `shep enable`.
+//!
+//! It used to be `[dog.log-rotate]` in `shep.toml`. A shepherd carrying the
+//! move reads any such section still there on its first boot, writes it into
+//! `dogs.toml` under the bare name, and strikes it from `shep.toml`. The
+//! body that reaches this module is unchanged either way, because the
+//! daemon serves the table without its header. What did change is the
+//! header [`PRINT_CONFIG`] prints: pasting the old one back into
+//! `shep.toml` after a migration leaves the same dog named in both files,
+//! which the daemon refuses to boot on rather than guess between.
 
 use core::fmt;
 
@@ -52,7 +61,7 @@ impl Default for Config {
     }
 }
 
-/// What could not be understood in a `[dog.log-rotate]` section.
+/// What could not be understood in a `[log-rotate]` section.
 ///
 /// Every variant names the offending field, and where possible the value
 /// that was rejected, so an operator can find the typo without reading this
@@ -62,7 +71,7 @@ pub enum ConfigError {
     /// The text was not valid TOML, or carried a key this dog does not know.
     ///
     /// Names no section. [`Error::Config`](crate::error::Error::Config) wraps
-    /// this and supplies the `[dog.<name>]` the text came from, so spelling one
+    /// this and supplies the `[<name>]` the text came from, so spelling one
     /// here would print two sections for one fault and get one of them wrong
     /// for any dog not adopted under the default name.
     Toml(String),
@@ -70,7 +79,7 @@ pub enum ConfigError {
     Size {
         /// The field the offending value was read from.
         field: &'static str,
-        /// The value as written in `shep.toml`.
+        /// The value as written in `dogs.toml`.
         value: String,
         /// The underlying parse failure.
         source: ParseMemSizeError,
@@ -80,7 +89,7 @@ pub enum ConfigError {
     Duration {
         /// The field the offending value was read from.
         field: &'static str,
-        /// The value as written in `shep.toml`.
+        /// The value as written in `dogs.toml`.
         value: String,
         /// The underlying parse failure.
         source: ParseUpDurationError,
@@ -178,10 +187,10 @@ fn parse_duration(value: String, field: &'static str) -> Result<UpDuration, Conf
 }
 
 impl Config {
-    /// Parse the `[dog.log-rotate]` table's body.
+    /// Parse the `[log-rotate]` table's body.
     ///
     /// The empty string is the ordinary case: a dog with no section in
-    /// `shep.toml` gets every default.
+    /// `dogs.toml` gets every default.
     ///
     /// # Errors
     /// - [`ConfigError::Toml`] - the text is not valid TOML, or carries a key
@@ -234,11 +243,18 @@ impl Config {
 /// A commented block naming every option and its default, for
 /// `shep-log-rotate --print-config`.
 ///
-/// Every line is commented, so appending it to `shep.toml` changes nothing
+/// Every line is commented, so appending it to `dogs.toml` changes nothing
 /// until the operator uncomments a line. A test asserts that what survives
 /// uncommenting parses back to [`Config::default()`], so this text cannot
 /// drift away from the code it documents.
-pub const PRINT_CONFIG: &str = r#"[dog.log-rotate]
+///
+/// The header is the bare name, and the file is `dogs.toml`. It was
+/// `[dog.log-rotate]` in `shep.toml` until shep moved a dog's settings into
+/// a file of their own, and a shepherd finding the same dog named in both
+/// files refuses to boot rather than guess which one the operator meant. So
+/// this block pasted into the old place after a migration is not a stale
+/// header, it is a daemon that will not start.
+pub const PRINT_CONFIG: &str = r#"[log-rotate]
 # Rotate a log once it reaches this size. shep's spelling: 10M, not 10MB.
 #max_size = "10M"
 # Optionally also rotate this long after the last rotation, whatever the
@@ -345,7 +361,7 @@ interval = "5s"
 
     #[test]
     fn every_value_the_printed_block_documents_is_the_value_the_code_uses() {
-        // PRINT_CONFIG has three kinds of line: the `[dog.log-rotate]` header,
+        // PRINT_CONFIG has three kinds of line: the `[log-rotate]` header,
         // prose comments (`# ` with a space), and commented settings
         // (`#key = value`, no space). Uncomment only the settings.
         let uncommented: Vec<&str> = PRINT_CONFIG
@@ -384,5 +400,16 @@ interval = "5s"
     #[test]
     fn the_printed_block_carries_no_em_dash() {
         assert_no_dashes(PRINT_CONFIG);
+    }
+
+    #[test]
+    fn the_printed_block_names_the_file_the_shepherd_reads_from() {
+        // Not cosmetic. A shepherd finding `[dog.log-rotate]` in shep.toml
+        // migrates it into dogs.toml and strikes it from the old file; find
+        // it in BOTH and it refuses to boot rather than guess. So a block
+        // that reverted to the old header would hand an operator a way to
+        // stop their daemon by following this dog's own instructions.
+        let header = PRINT_CONFIG.lines().next().expect("a first line");
+        assert_eq!(header, "[log-rotate]");
     }
 }

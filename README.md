@@ -43,8 +43,8 @@ lists it.
 The name it is adopted under is the name shep hands it in `$SHEP_DOG_NAME`, and
 it is also the config key. `--name` sets it, and defaults to the binary's file
 stem with a leading `shep-` stripped, so the command above lands on
-`log-rotate` and reads `[dog.log-rotate]`. Pass `--name rotator` and it reads
-`[dog.rotator]`. Any name works, as long as the section matches.
+`log-rotate` and reads `[log-rotate]`. Pass `--name rotator` and it reads
+`[rotator]`. Any name works, as long as the section matches.
 
 Be careful with that second command, though. `shep adopt` checks that a binary
 is runnable by actually running it, for about fifty milliseconds, with your
@@ -56,18 +56,25 @@ passing `--home`.
 
 ## Configuration
 
-Everything lives in one table in `shep.toml`. Ask the binary for a starting
-point:
+Everything lives in one table in `dogs.toml`, next to `shep.toml` in your
+shep home. Ask the binary for a starting point:
 
 ```sh
-shep-log-rotate --print-config >> ~/.shep/shep.toml
+shep-log-rotate --print-config >> ~/.shep/dogs.toml
 ```
 
 Every line it prints is commented, so appending it changes nothing until you
 uncomment something.
 
+Older versions of this dog printed `[dog.log-rotate]` for `shep.toml`. Shep
+has since moved a dog's settings into a file of their own, and a shepherd
+carrying that move migrates the old section on its first boot, then strikes
+it from `shep.toml`. Write it back there afterwards and the same dog is
+named in both files, which the shepherd refuses to boot on. Check
+`dogs.toml` first if you are following an old note.
+
 ```toml
-[dog.log-rotate]
+[log-rotate]
 max_size = "10M"    # rotate once a log reaches this size
 max_age  = "168h"   # optionally also rotate this long after the last rotation
 keep     = 5        # rotated generations to keep, at least 1
@@ -90,8 +97,11 @@ minutes and seconds in lowercase and no day unit at all. A week is `"168h"`,
 not `"7d"`. A bare number is milliseconds, so `max_age = "7"` means seven
 milliseconds and not seven of anything else.
 
-The dog re-reads this table on every pass, so editing `shep.toml` takes
-effect on the next interval without a restart.
+The dog re-reads this table on every pass, so editing `dogs.toml` takes
+effect on the next interval without a restart. That is this dog's own
+choice rather than something shep does for it: the shepherd serves the
+section fresh on every request and never pushes one, so a dog that asked
+only at startup would need bouncing.
 
 ## The two naming schemes
 

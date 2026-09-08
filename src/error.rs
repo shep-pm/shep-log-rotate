@@ -18,7 +18,7 @@ use crate::config::ConfigError;
 ///
 /// `Debug` is derived, deliberately, and that is a different answer from the
 /// one [`Live`](crate::tick::Live) gets. Everything this type carries is
-/// something an operator has to be told to act on it: the `[dog.<name>]`
+/// something an operator has to be told to act on it: the `[<name>]`
 /// section a fault was read from, and the path a filesystem call failed on.
 /// Both are already in `Display` for that reason, so redacting them from
 /// `Debug` would hide from a maintainer what is printed to a user anyway.
@@ -36,13 +36,13 @@ pub enum Error {
     Request(RequestError),
     /// The shepherd answered with a response this dog cannot use.
     Protocol(String),
-    /// The dog's own `[dog.<name>]` section could not be understood.
+    /// The dog's own `[<name>]` section could not be understood.
     ///
     /// Carries the section name rather than spelling a default one, because
     /// the name is whatever `$SHEP_DOG_NAME` said and naming the wrong
     /// section sends the reader to a block they never wrote.
     Config {
-        /// The `[dog.<name>]` key the section was read from.
+        /// The `[<name>]` key the section was read from, in `dogs.toml`.
         section: String,
         /// What could not be understood in it.
         source: ConfigError,
@@ -91,7 +91,7 @@ impl fmt::Display for Error {
             Self::Request(err) => write!(f, "the shepherd refused a request: {err}"),
             Self::Protocol(what) => write!(f, "unexpected answer from the shepherd: {what}"),
             Self::Config { section, source } => {
-                write!(f, "bad [dog.{section}] section: {source}")
+                write!(f, "bad [{section}] section: {source}")
             }
             Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
             Self::Exhausted { path } => {
@@ -169,7 +169,7 @@ mod tests {
             source: ConfigError::Keep,
         };
         let shown = err.to_string();
-        assert!(shown.contains("[dog.weathervane]"), "{shown}");
+        assert!(shown.contains("[weathervane]"), "{shown}");
         assert!(
             !shown.contains("log-rotate"),
             "the default name leaked into a dog adopted as something else: {shown}"
@@ -185,10 +185,10 @@ mod tests {
         let shown = err.to_string();
         assert_eq!(
             shown,
-            "bad [dog.weathervane] section: invalid TOML: expected `=` after a key"
+            "bad [weathervane] section: invalid TOML: expected `=` after a key"
         );
         assert_eq!(
-            shown.matches("[dog.").count(),
+            shown.matches('[').count(),
             1,
             "one fault names one section: {shown}"
         );
