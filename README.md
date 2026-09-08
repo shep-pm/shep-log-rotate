@@ -40,6 +40,13 @@ is exactly the one cargo declines to do: it prints `already installed, use
 the shepherd supervises it like anything else in the flock, and `shep dogs`
 lists it.
 
+Adopting also asks the binary two questions and reads the answers off its
+stdout. `--version` gives the build and the wire protocol it was compiled
+against. A dog below the shepherd's floor is refused right there, before
+anything is written down. `--schema` gives a JSON Schema for the settings below,
+which is what `shep lookout` draws the config pane from. The binary answers
+both before it opens a socket, so neither question costs a connection.
+
 The name it is adopted under is the name shep hands it in `$SHEP_DOG_NAME`, and
 it is also the config key. `--name` sets it, and defaults to the binary's file
 stem with a leading `shep-` stripped, so the command above lands on
@@ -102,6 +109,12 @@ effect on the next interval without a restart. That is this dog's own
 choice rather than something shep does for it: the shepherd serves the
 section fresh on every request and never pushes one, so a dog that asked
 only at startup would need bouncing.
+
+`shep lookout` can edit the same table. Press `s` for the dog list, then `e`
+on this dog's row, and you get a form built from the schema `--schema`
+prints: one row per setting, with the two grammars above resolved, so a
+bare `interval = "10"` reads as ten milliseconds rather than as ten of
+something you have to guess at. Writing needs `--allow-control`.
 
 ## The two naming schemes
 

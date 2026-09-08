@@ -931,7 +931,9 @@ version = "0.1.6"
 dependencies = [
  "flate2",
  "jiff",
+ "schemars",
  "serde",
+ "serde_json",
  "shep-client",
  "tempfile",
  "tokio",

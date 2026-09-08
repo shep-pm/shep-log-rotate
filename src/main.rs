@@ -6,6 +6,24 @@
 //! reopen them, and then compresses and prunes what it rotated. All of that
 //! lives in [`tick`](crate::tick::tick); this file is the process around it.
 //!
+//! # The two questions shep asks the binary
+//!
+//! Before the loop there is a probe. `shep adopt` spawns this binary with
+//! `--version`, reads the build and the `PROTOCOL_VERSION` it was compiled
+//! against, and refuses a dog below its own floor; then with `--schema`,
+//! and reads a JSON Schema for the `[<name>]` section, which is what lookout
+//! draws a settings pane from. Both are answered by
+//! [`shep_client::dogs::probe`], from [`Config`]'s own deserialization type,
+//! on the first line of [`main`] and before this process opens a socket or
+//! a file.
+//!
+//! Answering is optional in the contract and not optional here. A dog that
+//! says nothing to `--version` is adopted with its protocol unknown, and a
+//! dog that says nothing to `--schema` has no pane and a section an operator
+//! hand-edits. This one was worse than silent before the probe existed: its
+//! argument parser refused every flag it did not know, so `--version` got a
+//! usage message on stderr and a failing exit status.
+//!
 //! # How it learns its own name
 //!
 //! Two names, from two places, and conflating them is how this went wrong
@@ -29,9 +47,10 @@
 //! which is byte for byte what a dog running on its defaults gets. Adopt
 //! this binary as `logrotate` when it asks for `log-rotate` and every
 //! setting in the operator's `dogs.toml` is discarded without either side
-//! saying so. It is the handshake name whenever there is one, and
-//! [`DEFAULT_NAME`] when there is not, because somebody running this binary
-//! by hand still wants their `dogs.toml` read.
+//! saying so. It is
+//! the handshake name whenever there is one, and [`DEFAULT_NAME`] when
+//! there is not, because somebody running this binary by hand still wants
+//! their `dogs.toml` read.
 
 #![forbid(unsafe_code)]
 
@@ -88,6 +107,13 @@ Usage:
   shep-log-rotate --print-config  Print a commented [log-rotate] block for
                                   dogs.toml naming every option and its
                                   default, then exit.
+  shep-log-rotate --version       Print the build and the protocol version
+                                  it speaks, then exit.
+  shep-log-rotate --schema        Print a JSON Schema for the [log-rotate]
+                                  section, then exit.
+
+The last two are what `shep adopt` asks this binary, and they are answered
+only as the first argument, which is the only one shep passes.
 
 Settings are read from `dogs.toml` over the shepherd's own socket, never
 from this process's arguments. The environment supplies two things and no
@@ -100,6 +126,11 @@ shepherd sets both when it spawns this dog.";
 /// larger than the whole of this binary's argument surface, and that surface
 /// is deliberately closed. Everything configurable is configured in
 /// `dogs.toml`, where the shepherd can serve it.
+///
+/// shep's own two flags are not in here. `--version` and `--schema` are
+/// answered and exited on by [`shep_client::dogs::probe`] before [`main`]
+/// builds an [`Action`] at all, so this enum only ever sees a run that is
+/// not a probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     /// Run the poll loop until the shepherd stops this process.
@@ -139,6 +170,13 @@ impl Action {
     /// `--print-config --print-config` with "shep-log-rotate does not
     /// understand --print-config", which is a confusing thing to tell
     /// somebody who plainly does.
+    ///
+    /// `--version` and `--schema` are refused here and answered elsewhere,
+    /// which is not a contradiction. `probe` reads the first argument,
+    /// because the first argument is the only one shep passes a candidate
+    /// binary, so a probe flag anywhere else reaches this parser instead.
+    /// Refusing it with the general message would tell somebody that this
+    /// binary does not understand a flag it plainly does, so it gets its own.
     pub fn parse<'a, I: IntoIterator<Item = &'a str>>(args: I) -> Result<Self, Usage> {
         let mut action = Self::Run;
         for arg in args {
@@ -146,6 +184,12 @@ impl Action {
                 "--print-config" => action = Self::PrintConfig,
                 "--help" | "-h" => {
                     return Err(Usage("shep-log-rotate takes no options.".to_owned()));
+                }
+                probe @ ("--version" | "--schema") => {
+                    return Err(Usage(format!(
+                        "shep-log-rotate answers {probe} as its first argument only, which is \
+                         where the shepherd asks it."
+                    )));
                 }
                 other => {
                     return Err(Usage(format!(
@@ -354,6 +398,19 @@ async fn wait(interval: UpDuration, stop: &mut Stop) -> Interrupted {
 }
 
 fn main() -> ExitCode {
+    // First, before this process opens a socket or a file. `shep adopt`
+    // spawns this binary with `--version` and then with `--schema`, reads
+    // one line of stdout, and kills the process group; a dog that has
+    // already started connecting is a dog answering a question late, and a
+    // dog that touched `$SHEP_HOME` on the way is one that did work nobody
+    // asked for. `probe` answers either flag and exits, and returns for
+    // every other run, this dog's own `--print-config` included.
+    //
+    // `env!` here rather than inside `probe`: it expands where it is
+    // written, so a call that spelled it in shep-client would report
+    // shep-client's version as this dog's.
+    shep_client::dogs::probe::<config::Section>(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     let action = match Action::parse(args.iter().map(String::as_str)) {
         Ok(action) => action,
@@ -448,6 +505,36 @@ mod tests {
             Action::parse(["--print-config", "--print-config"]),
             Ok(Action::PrintConfig)
         );
+    }
+
+    #[test]
+    fn a_probe_flag_out_of_first_position_is_told_where_it_belongs() {
+        // `probe` reads the first argument only, because the first argument
+        // is the only one shep passes a candidate binary. So these two reach
+        // this parser anywhere else, and the general refusal would tell
+        // somebody that shep-log-rotate does not understand a flag it
+        // plainly answers.
+        for flag in ["--version", "--schema"] {
+            let usage = Action::parse(["--print-config", flag])
+                .expect_err("refused")
+                .to_string();
+            assert!(usage.contains(flag), "{usage}");
+            assert!(usage.contains("first argument"), "{usage}");
+            assert!(
+                !usage.contains("does not understand"),
+                "this binary does understand it: {usage}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_usage_text_names_every_flag_this_binary_answers() {
+        // Including the two the probe takes. They never reach `Action`, and
+        // somebody reading `--help` is asking what the binary does, not
+        // which function inside it does the doing.
+        for flag in ["--print-config", "--version", "--schema"] {
+            assert!(USAGE.contains(flag), "usage omits {flag}");
+        }
     }
 
     #[test]
