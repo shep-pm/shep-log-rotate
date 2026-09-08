@@ -95,6 +95,21 @@ fn the_protocol_this_dog_announces_is_one_a_shepherd_still_accepts() {
     let parsed = parse_version_answer(&answer).expect("a readable answer");
     let announced = parsed.protocol.expect("a protocol line");
 
+    // A literal, because the comparison below cannot fail on its own. Both
+    // constants come from the one shep-core this crate links, and shep-core's
+    // own `the_floor_never_outruns_the_ceiling` already pins
+    // `MIN_SUPPORTED <= PROTOCOL_VERSION`, so a bump that moved both would
+    // slide past a purely relative check. shep-core pins its own number the
+    // same way for the same reason.
+    //
+    // So this failing is not a defect, it is the prompt: shep has moved the
+    // protocol, and somebody has to run the integration tier against a
+    // shepherd built from that release before changing the number here.
+    assert_eq!(
+        announced, 8,
+        "this dog announces protocol {announced}, and this crate was last verified against a \
+         shepherd speaking 8. Run the integration tier against the new shep before moving this."
+    );
     assert!(
         announced >= MIN_SUPPORTED,
         "this dog announces protocol {announced} and the shepherd accepts nothing below \

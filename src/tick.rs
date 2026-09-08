@@ -79,7 +79,7 @@ use crate::{
 pub trait Daemon {
     /// The dog's own `[<name>]` section of `dogs.toml`, as TOML text.
     ///
-    /// Empty when `shep.toml` has no such section, which is the ordinary
+    /// Empty when `dogs.toml` has no such section, which is the ordinary
     /// case for a dog running on its defaults.
     ///
     /// # Errors

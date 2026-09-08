@@ -197,7 +197,15 @@ impl core::error::Error for ConfigError {
 /// section's own description, and everything above is written for whoever
 /// maintains this file. `Section` is not a name an operator has any use for
 /// either.
-#[derive(Deserialize, JsonSchema, DogConfig)]
+///
+/// `Debug` is derived rather than written by hand, which is the decision the
+/// checked-in rules ask for out loud. Every field here is a size, a
+/// duration, a count or a flag an operator typed into `dogs.toml`. None of
+/// them is a path, an environment, or a credential, so there is nothing for
+/// a hand-written impl to redact and no exact-string test to pin it with.
+/// [`Live`](crate::tick::Live) is the type in this crate that goes the other
+/// way, and it does so because it holds a socket path.
+#[derive(Debug, Deserialize, JsonSchema, DogConfig)]
 #[serde(deny_unknown_fields)]
 #[schemars(
     title = "log-rotate",
