@@ -26,13 +26,38 @@ integration = []
 # Published 2026-08-26, so the git and branch keys are gone and this resolves
 # from the registry. The lockfile is what proves which source was used.
 #
-# The floor is 0.1.23 because that is the first release carrying
-# `ReconnectingClient::connect_as_dog`, and below it there is no public way
-# to put a name in the Hello frame. shep marks a dog as having handshaken
-# only when the frame names one, so a dog built against an older client
-# serves every request correctly and is still rendered `silent`, restarted
-# once, and then declared stale. See the module docs in src/main.rs.
-shep-client = "0.1.23"
+# The floor is 0.7.3, and it is two floors in one.
+#
+# Protocol first. A dog announces the `PROTOCOL_VERSION` of the shep-core it
+# was compiled against, and the shepherd refuses a handshake below its own
+# `MIN_SUPPORTED`. Both numbers are 8 today. Protocol 8 first shipped in
+# 0.6.2, but a `0.x` requirement cannot span a minor, so asking for 0.6.2
+# would lock this dog out of the 0.7 line it has to speak to.
+#
+# Then the schema. `MemSize` and `UpDuration` carry their `JsonSchema` impls
+# behind shep-core's own `schema` feature, and until 0.7.3 shep-client's
+# `schema` turned on `schemars` without reaching down to turn that one on. A
+# dog borrowing shep's grammars for its config type needed a second, direct
+# shep-core dependency to say so. 0.7.3 forwards the feature, so that entry
+# is gone and `shep_client::shep_core` is the only path to these types
+# again. Drop below 0.7.3 and `src/config.rs` stops compiling, which is a
+# clearer failure than the handshake one but a floor either way.
+#
+# Two older floors, kept here because each is still load-bearing and neither
+# is visible in a version number:
+#
+# - 0.1.23 first carried `ReconnectingClient::connect_as_dog`. shep records a
+#   handshake only for a connection that names a dog, so without it this
+#   binary serves every request correctly and is still rendered `silent`,
+#   restarted once, and then declared stale. See the module docs in
+#   src/main.rs.
+# - 0.2.2 first carried `dogs::probe`, which answers the `--version` and
+#   `--schema` questions shep asks a candidate binary during `shep adopt`.
+shep-client = "0.7.3"
+# `#[derive(JsonSchema)]` expands to absolute `schemars::` paths, so the
+# crate has to be nameable here even though shep-client already carries it.
+# Same version floor shep itself pins, so this adds an edge and not a crate.
+schemars = { version = "1.2.2", default-features = false, features = ["derive", "std"] }
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "time", "signal", "sync"] }
 toml = "0.8"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
@@ -45,7 +70,10 @@ tempfile = "3"
 # against a real `ReconnectingClient` rather than asserted in a comment. The
 # feature gates shep-client's own `testing` module, which binds a fake
 # shepherd this crate can connect to. Nothing in the shipped binary sees it.
-shep-client = { version = "0.1.23", features = ["test-support"] }
+shep-client = { version = "0.7.3", features = ["test-support"] }
+# The schema tests read the JSON `config_schema` builds, so they need the
+# type it is made of. Nothing in the shipped binary names serde_json.
+serde_json = "1"
 
 [[test]]
 name = "integration"

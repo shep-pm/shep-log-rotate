@@ -1,22 +1,44 @@
-//! The `[dog.log-rotate]` section of `shep.toml`.
+//! The `[log-rotate]` section of `dogs.toml`.
 //!
 //! The daemon serves this per request rather than caching it, so this dog
 //! re-reads it every tick and never caches it either. Changing `max_size`
 //! should not need a `shep disable` and `shep enable`.
+//!
+//! It used to be `[dog.log-rotate]` in `shep.toml`. A shepherd carrying the
+//! move reads any such section still there on its first boot, writes it into
+//! `dogs.toml` under the bare name, and strikes it from `shep.toml`. The
+//! body that reaches this module is unchanged either way, because the
+//! daemon serves the table without its header. What did change is the
+//! header [`PRINT_CONFIG`] prints: pasting the old one back into
+//! `shep.toml` after a migration leaves the same dog named in both files,
+//! which the daemon refuses to boot on rather than guess between.
 
 use core::fmt;
 
+use schemars::JsonSchema;
 use serde::Deserialize;
-use shep_client::shep_core::values::{
-    MemSize, ParseMemSizeError, ParseUpDurationError, UpDuration,
+use shep_client::{
+    dogs::DogConfig,
+    shep_core::values::{MemSize, ParseMemSizeError, ParseUpDurationError, UpDuration},
 };
 
 /// How rotated generations are named. See the README for the trade-off.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `JsonSchema` so [`Section::naming`] can publish the two spellings as a
+/// closed set rather than as an open string: lookout renders a schema's
+/// `enum` as a value an operator cycles through, and a bare `string` as one
+/// they have to know how to spell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
+#[schemars(
+    rename_all = "lowercase",
+    description = "How a rotated generation is named."
+)]
 pub enum Naming {
     /// `web-0-out.2026-08-20T15-04-05.log`. The default.
+    #[schemars(description = "web-0-out.2026-08-20T15-04-05.log, in UTC, still matching *.log.")]
     Dated,
     /// `web-0-out.log.1`, shifting on every rotation. Newest is `.1`.
+    #[schemars(description = "web-0-out.log.1, shifting along on every rotation. Newest is .1.")]
     Numeric,
 }
 
@@ -52,7 +74,7 @@ impl Default for Config {
     }
 }
 
-/// What could not be understood in a `[dog.log-rotate]` section.
+/// What could not be understood in a `[log-rotate]` section.
 ///
 /// Every variant names the offending field, and where possible the value
 /// that was rejected, so an operator can find the typo without reading this
@@ -62,7 +84,7 @@ pub enum ConfigError {
     /// The text was not valid TOML, or carried a key this dog does not know.
     ///
     /// Names no section. [`Error::Config`](crate::error::Error::Config) wraps
-    /// this and supplies the `[dog.<name>]` the text came from, so spelling one
+    /// this and supplies the `[<name>]` the text came from, so spelling one
     /// here would print two sections for one fault and get one of them wrong
     /// for any dog not adopted under the default name.
     Toml(String),
@@ -70,7 +92,7 @@ pub enum ConfigError {
     Size {
         /// The field the offending value was read from.
         field: &'static str,
-        /// The value as written in `shep.toml`.
+        /// The value as written in `dogs.toml`.
         value: String,
         /// The underlying parse failure.
         source: ParseMemSizeError,
@@ -80,7 +102,7 @@ pub enum ConfigError {
     Duration {
         /// The field the offending value was read from.
         field: &'static str,
-        /// The value as written in `shep.toml`.
+        /// The value as written in `dogs.toml`.
         value: String,
         /// The underlying parse failure.
         source: ParseUpDurationError,
@@ -140,18 +162,79 @@ impl core::error::Error for ConfigError {
     }
 }
 
-/// The section's fields, read as strings so `max_size` and `max_age` go
-/// through shep's own `FromStr` rather than serde's numeric deserializers.
+/// The section's fields, and the type shep reads this dog's config schema
+/// off. `main` hands it to `shep_client::dogs::probe`, which answers
+/// `--schema` with it during `shep adopt` and again whenever lookout opens
+/// the settings pane.
+///
+/// Every field is read as a string so `max_size` and `max_age` go through
+/// shep's own `FromStr` rather than serde's numeric deserializers.
 /// Deserializing a bare number would silently accept spellings shep itself
 /// refuses.
-#[derive(Deserialize)]
+///
+/// The schema says something narrower than the Rust type, deliberately.
+/// `#[schemars(with = ...)]` publishes shep's own grammar for each of those
+/// fields instead of the bare `string` an `Option<String>` would produce,
+/// which buys two things. The pattern stays in shep-core, so this crate
+/// carries no second copy of a grammar to drift from. And lookout reads the
+/// `$ref` name to decide what a unitless number means, so `max_size = "10"`
+/// renders as bytes and `interval = "10"` as milliseconds, which is what
+/// each of them actually is.
+///
+/// `DogConfig` carries no `#[shep(secret)]`, because nothing in here is a
+/// credential: this dog is told about sizes and durations and never about
+/// where to send anything. The derive is still what lets `config_schema`
+/// publish the section at all, and a config type with nothing to mark still
+/// wants the impl.
+///
+/// Field docs are not decoration here. lookout shows a property's
+/// `description` beside it in the pane, on one line and clipped to the
+/// terminal's width, so each of them leads with the sentence an operator
+/// needs and leaves the rest to [`PRINT_CONFIG`] and the README.
+///
+/// `title` and `description` are given rather than taken from this comment
+/// for the same reason. schemars would publish everything above as the
+/// section's own description, and everything above is written for whoever
+/// maintains this file. `Section` is not a name an operator has any use for
+/// either.
+///
+/// `Debug` is derived rather than written by hand, which is the decision the
+/// checked-in rules ask for out loud. Every field here is a size, a
+/// duration, a count or a flag an operator typed into `dogs.toml`. None of
+/// them is a path, an environment, or a credential, so there is nothing for
+/// a hand-written impl to redact and no exact-string test to pin it with.
+/// [`Live`](crate::tick::Live) is the type in this crate that goes the other
+/// way, and it does so because it holds a socket path.
+#[derive(Debug, Deserialize, JsonSchema, DogConfig)]
 #[serde(deny_unknown_fields)]
-struct Raw {
+#[schemars(
+    title = "log-rotate",
+    description = "Settings for the shep-log-rotate dog: when to rotate a log, how to name \
+                   what it rotates into, and how much of it to keep."
+)]
+pub struct Section {
+    /// Rotate a log once it reaches this size. shep's spelling: 10M, not 10MB.
+    #[schemars(with = "Option<MemSize>")]
     max_size: Option<String>,
+    /// Also rotate this long after the last rotation, whatever the size.
+    /// Unset means size only.
+    #[schemars(with = "Option<UpDuration>")]
     max_age: Option<String>,
+    /// Generations to keep. Older ones are deleted.
+    // The floor is here as well as in `from_toml` because this is the copy a
+    // settings pane reads. Without it the pane offers a `keep = 0` that the
+    // dog then refuses on its next tick, in a file the operator has already
+    // saved and moved on from.
+    #[schemars(range(min = 1))]
     keep: Option<usize>,
+    /// How rotated generations are named: "dated" stamps the time into the
+    /// name, "numeric" shifts a .1 suffix along on every rotation.
+    #[schemars(with = "Option<Naming>")]
     naming: Option<String>,
+    /// gzip rotated generations. The newest is left plain so it stays greppable.
     compress: Option<bool>,
+    /// How often to look for a log worth rotating.
+    #[schemars(with = "Option<UpDuration>")]
     interval: Option<String>,
 }
 
@@ -178,10 +261,10 @@ fn parse_duration(value: String, field: &'static str) -> Result<UpDuration, Conf
 }
 
 impl Config {
-    /// Parse the `[dog.log-rotate]` table's body.
+    /// Parse the `[log-rotate]` table's body.
     ///
     /// The empty string is the ordinary case: a dog with no section in
-    /// `shep.toml` gets every default.
+    /// `dogs.toml` gets every default.
     ///
     /// # Errors
     /// - [`ConfigError::Toml`] - the text is not valid TOML, or carries a key
@@ -194,7 +277,8 @@ impl Config {
     /// - [`ConfigError::Interval`] - `interval = 0`, which would poll
     ///   without pause.
     pub fn from_toml(text: &str) -> Result<Self, ConfigError> {
-        let raw: Raw = toml::from_str(text).map_err(|err| ConfigError::Toml(err.to_string()))?;
+        let raw: Section =
+            toml::from_str(text).map_err(|err| ConfigError::Toml(err.to_string()))?;
         let defaults = Self::default();
         let interval = raw
             .interval
@@ -234,11 +318,18 @@ impl Config {
 /// A commented block naming every option and its default, for
 /// `shep-log-rotate --print-config`.
 ///
-/// Every line is commented, so appending it to `shep.toml` changes nothing
+/// Every line is commented, so appending it to `dogs.toml` changes nothing
 /// until the operator uncomments a line. A test asserts that what survives
 /// uncommenting parses back to [`Config::default()`], so this text cannot
 /// drift away from the code it documents.
-pub const PRINT_CONFIG: &str = r#"[dog.log-rotate]
+///
+/// The header is the bare name, and the file is `dogs.toml`. It was
+/// `[dog.log-rotate]` in `shep.toml` until shep moved a dog's settings into
+/// a file of their own, and a shepherd finding the same dog named in both
+/// files refuses to boot rather than guess which one the operator meant. So
+/// this block pasted into the old place after a migration is not a stale
+/// header, it is a daemon that will not start.
+pub const PRINT_CONFIG: &str = r#"[log-rotate]
 # Rotate a log once it reaches this size. shep's spelling: 10M, not 10MB.
 #max_size = "10M"
 # Optionally also rotate this long after the last rotation, whatever the
@@ -345,7 +436,7 @@ interval = "5s"
 
     #[test]
     fn every_value_the_printed_block_documents_is_the_value_the_code_uses() {
-        // PRINT_CONFIG has three kinds of line: the `[dog.log-rotate]` header,
+        // PRINT_CONFIG has three kinds of line: the `[log-rotate]` header,
         // prose comments (`# ` with a space), and commented settings
         // (`#key = value`, no space). Uncomment only the settings.
         let uncommented: Vec<&str> = PRINT_CONFIG
@@ -384,5 +475,149 @@ interval = "5s"
     #[test]
     fn the_printed_block_carries_no_em_dash() {
         assert_no_dashes(PRINT_CONFIG);
+    }
+
+    #[test]
+    fn the_printed_block_names_the_file_the_shepherd_reads_from() {
+        // Not cosmetic. A shepherd finding `[dog.log-rotate]` in shep.toml
+        // migrates it into dogs.toml and strikes it from the old file; find
+        // it in BOTH and it refuses to boot rather than guess. So a block
+        // that reverted to the old header would hand an operator a way to
+        // stop their daemon by following this dog's own instructions.
+        let header = PRINT_CONFIG.lines().next().expect("a first line");
+        assert_eq!(header, "[log-rotate]");
+    }
+
+    /// `probe` prints this to stdout for `--schema` and exits 0. The one way
+    /// it can fail is a `#[shep(secret)]` that landed on no property, and
+    /// then it prints the fault and exits 1 instead, which shep reads as a
+    /// dog with an unreadable schema. Nothing here is marked today, so this
+    /// is the guard for the day something is.
+    #[test]
+    fn the_schema_is_publishable() {
+        shep_client::dogs::config_schema::<Section>().expect("no marked field is missing");
+    }
+
+    /// The schema's property names, sorted.
+    fn schema_keys() -> Vec<String> {
+        let schema = shep_client::dogs::config_schema::<Section>().expect("publishable");
+        let mut keys: Vec<String> = schema
+            .as_value()
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("an object schema has properties")
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    #[test]
+    fn the_schema_and_the_printed_block_name_the_same_settings() {
+        // Three things have to agree about what this dog's settings are:
+        // `Section`'s fields, the block `--print-config` prints, and the
+        // schema a settings pane draws a form from. The first two already
+        // had a test between them. This is the third edge, and it is the one
+        // that matters most, because a pane writing a key `from_toml`
+        // refuses produces a section the dog rejects on its next tick, in a
+        // file the operator has already saved and walked away from.
+        let mut printed: Vec<String> = PRINT_CONFIG
+            .lines()
+            .filter_map(|line| line.strip_prefix('#'))
+            .filter(|rest| !rest.starts_with(' '))
+            .filter_map(|setting| setting.split_once(' '))
+            .map(|(key, _)| key.to_owned())
+            .collect();
+        printed.sort();
+
+        assert_eq!(printed.len(), 6, "one key per setting, got {printed:?}");
+        assert_eq!(schema_keys(), printed);
+    }
+
+    #[test]
+    fn the_schema_borrows_sheps_grammars_rather_than_copying_them() {
+        // A `$ref` and not an inlined pattern, for two reasons. The pattern
+        // stays shep-core's, so this crate has no second copy to drift from.
+        // And lookout reads the ref's NAME to decide what a unitless value
+        // means, so `max_size = "10"` is shown as bytes and `interval =
+        // "10"` as milliseconds. Inline the pattern and both read as raw
+        // digits, which is exactly the confusion the two grammars exist to
+        // settle.
+        let schema = shep_client::dogs::config_schema::<Section>().expect("publishable");
+        let schema = schema.as_value();
+
+        for (field, grammar) in [
+            ("max_size", "MemSize"),
+            ("max_age", "UpDuration"),
+            ("interval", "UpDuration"),
+        ] {
+            let reference = schema
+                .pointer(&format!("/properties/{field}/anyOf/0/$ref"))
+                .and_then(serde_json::Value::as_str);
+            assert_eq!(
+                reference,
+                Some(format!("#/$defs/{grammar}").as_str()),
+                "{field} should name shep's own {grammar}"
+            );
+        }
+
+        assert!(
+            schema.pointer("/$defs/MemSize/pattern").is_some(),
+            "the referenced grammar carries the pattern: {schema}"
+        );
+    }
+
+    #[test]
+    fn the_schema_offers_the_two_naming_schemes_and_no_others() {
+        // A closed set rather than a string. lookout cycles a field whose
+        // schema is a `oneOf` of consts and makes an operator spell one whose
+        // schema is a bare string, and `from_toml` refuses everything but
+        // these two either way.
+        let schema = shep_client::dogs::config_schema::<Section>().expect("publishable");
+        let choices: Vec<String> = schema
+            .as_value()
+            .pointer("/$defs/Naming/oneOf")
+            .and_then(serde_json::Value::as_array)
+            .expect("a unit enum is a oneOf")
+            .iter()
+            .filter_map(|arm| arm.get("const").and_then(serde_json::Value::as_str))
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(choices, ["dated", "numeric"]);
+
+        for choice in &choices {
+            Config::from_toml(&format!("naming = \"{choice}\""))
+                .expect("every spelling the schema offers is one from_toml takes");
+        }
+    }
+
+    #[test]
+    fn the_schema_refuses_a_key_this_dog_would_refuse_anyway() {
+        // `deny_unknown_fields` on the Rust type and `additionalProperties:
+        // false` in the schema are the same rule stated twice, once for each
+        // reader. Without the second one a pane offers to add a key that
+        // `from_toml` then reports as a typo.
+        let schema = shep_client::dogs::config_schema::<Section>().expect("publishable");
+        assert_eq!(
+            schema.as_value().get("additionalProperties"),
+            Some(&serde_json::Value::Bool(false))
+        );
+    }
+
+    #[test]
+    fn the_schema_carries_no_em_dash_and_none_of_this_files_own_reasoning() {
+        // Every description in here is printed to an operator, so the dash
+        // rule reaches it. The second half is the one that actually slipped:
+        // schemars publishes a type's doc comment as its description, and
+        // this file's doc comments are long on purpose and written for
+        // whoever maintains it. `Section` and `Naming` both override theirs.
+        let schema = shep_client::dogs::config_schema::<Section>().expect("publishable");
+        let rendered = schema.as_value().to_string();
+        assert_no_dashes(&rendered);
+        assert!(
+            !rendered.contains("schemars"),
+            "an internal doc comment reached the published schema: {rendered}"
+        );
     }
 }
