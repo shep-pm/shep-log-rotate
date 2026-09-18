@@ -556,22 +556,41 @@ fn adopt_puts_a_dog_in_the_listing_and_rehome_takes_it_out() {
     assert!(adopted.contains("\"kind\":\"adopted\""), "{adopted}");
     assert!(adopted.contains(DOG_BIN), "{adopted}");
 
-    shepherd.ok(&["rehome", "weathervane", "--style", "bare"]);
+    let rehomed = shepherd.run(&["rehome", "weathervane", "--style", "bare"]);
+    assert!(
+        rehomed.status.success(),
+        "shep rehome failed: {}",
+        String::from_utf8_lossy(&rehomed.stderr)
+    );
+    // The operator's only notice that the settings they wrote survived the
+    // verb. shep gates it on there being a section to keep, so its absence
+    // would mean the section had gone whatever the file says below.
+    let notice = String::from_utf8_lossy(&rehomed.stderr);
+    assert!(
+        notice.contains("kept [weathervane] in dogs.toml"),
+        "rehome kept the settings and said nothing about it: {notice}"
+    );
     wait_until("the rehomed dog to leave the listing", || {
         !shepherd
             .ok(&["dogs", "--format", "json"])
             .contains("weathervane")
     });
-    // Both files: the registration in shep.toml and the dog's own section
-    // in dogs.toml. `rehome` is the verb that forgets the second one, which
-    // is what tells it apart from a plain `disable`.
-    for file in ["shep.toml", "dogs.toml"] {
-        let config = fs::read_to_string(shepherd.home().join(file)).unwrap_or_default();
-        assert!(
-            !config.contains("weathervane"),
-            "rehome forgets the [<name>] table too, and {file} still names it: {config}"
-        );
-    }
+    // Two files, and rehome treats them differently since shep's
+    // `fix(cli)!: shep rehome keeps the settings an operator wrote for a
+    // dog`. It strikes the registration from shep.toml and leaves the
+    // `[<name>]` an operator wrote in dogs.toml. What tells it apart from
+    // `disable` is `adopted_dogs`: a disabled dog comes back with `enable`,
+    // a rehomed one needs a fresh `shep adopt <path>`.
+    let registration = fs::read_to_string(shepherd.home().join("shep.toml")).unwrap_or_default();
+    assert!(
+        !registration.contains("weathervane"),
+        "rehome strikes the registration, and shep.toml still names it: {registration}"
+    );
+    let settings = fs::read_to_string(shepherd.home().join("dogs.toml")).unwrap_or_default();
+    assert!(
+        settings.contains("[weathervane]") && settings.contains("64M"),
+        "rehome keeps what an operator wrote, and dogs.toml lost it: {settings}"
+    );
 }
 
 #[test]
