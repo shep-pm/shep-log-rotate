@@ -9,6 +9,12 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 keywords = ["shep", "process-manager", "logrotate", "logging"]
 categories = ["command-line-utilities"]
+# `docs/` is this project's own planning and design notes, written by the
+# skills that produced the code. They are worth keeping in the repository
+# and are not worth shipping: a published .crate is permanent, so every
+# draft in there would outlive the decisions it argues about, and docs.rs
+# would carry them beside the API. The repository is where to read them.
+exclude = ["/docs/"]
 
 [features]
 # The tier that drives a REAL shepherd. Off by default because it needs a
