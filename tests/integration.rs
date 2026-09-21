@@ -539,16 +539,10 @@ fn the_dog_reads_the_section_of_the_name_it_was_adopted_under() {
 
 #[test]
 fn a_section_the_dog_cannot_parse_stops_the_process() {
-    // Against a real shepherd because the fake one in the unit tier serves
-    // whatever text it is handed, and the question here is what a daemon
-    // does with a `dogs.toml` somebody hand-edited: it serves the section
-    // through without minding the value, and this dog is the only party
-    // that can tell the value is wrong.
-    //
-    // `1d` is the value from the incident. shep's duration grammar has no
-    // day unit at all, so a week is `168h`, and a dog that retried this
-    // handshook, answered, rotated nothing, and was reported online for as
-    // long as nobody read its own log.
+    // A real shepherd because the fake one serves whatever text it is
+    // handed: only a daemon passing a hand-edited `dogs.toml` through
+    // proves this dog is the party that catches the value. `1d` is the
+    // value from the incident; shep's grammar has no day unit.
     let shepherd = Shepherd::new();
     let idle = write_script(shepherd.home(), "idle.sh", "#!/bin/sh\nsleep 300\n");
     shepherd.write_config("[log-rotate]\nmax_age = \"1d\"\n");

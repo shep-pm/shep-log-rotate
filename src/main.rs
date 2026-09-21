@@ -281,34 +281,18 @@ fn refused(daemon_version: Option<&str>, message: &str) -> ExitCode {
 /// Say why this dog is stopping on a `[<name>]` section it cannot read.
 ///
 /// The whole line, prefix included, so a caller prints one thing and is
-/// done. Returned rather than printed because it is the one part of this
-/// decision a test can read.
+/// done. Returned rather than printed so a test can read it.
 ///
-/// This is [`refused`]'s argument with a different cause and the same
-/// shape. A value the config parser rejects is not a condition that
-/// resolves itself: nothing changes until somebody edits `dogs.toml`, so
-/// every retry is the same failure at the same interval, written into the
-/// log this dog exists to keep small.
+/// [`refused`]'s argument with a different cause. A value the parser
+/// rejects is not a condition that resolves itself: nothing changes until
+/// somebody edits `dogs.toml`, so every retry is the same failure at the
+/// same interval, in the log this dog exists to keep small. A dog that
+/// kept ticking would handshake, answer, rotate nothing, and still be
+/// rendered online.
 ///
-/// Exiting is also the only way an operator finds out. A dog that keeps
-/// ticking on a section it cannot read still connects, still handshakes,
-/// still answers, and `shep list` goes on calling it online while it
-/// rotates nothing at all. The fault is in this dog's own log and nowhere
-/// else, so somebody has to already suspect it to go looking. A dog that
-/// is down says so by itself.
-///
-/// It costs the self-healing the retry arm had, and that is the trade
-/// rather than an oversight. A dog that retried picked up a corrected
-/// `dogs.toml` on its next tick and nobody had to do anything. This one
-/// exhausts the shepherd's restart budget in seconds and lands `Errored`,
-/// so correcting the typo now needs a `shep restart` as well. A wrong
-/// status nobody can see is worse than a right one somebody has to clear.
-///
-/// The `shep restart` it suggests names the section, which is the adopted
-/// name for every dog a shepherd spawned: see [`Identity`], where the two
-/// names part company only when nothing adopted this process, and in that
-/// case the reader started the binary by hand and can start it again the
-/// same way.
+/// The cost is self-healing: the fix now needs a `shep restart` as well.
+/// The one this names uses the section, which is the adopted name
+/// whenever a shepherd spawned the process. See [`Identity`].
 fn cannot_read_config(section: &str, source: &ConfigError) -> String {
     format!(
         "shep-log-rotate: the [{section}] section in dogs.toml cannot be read: {source}. \
@@ -675,17 +659,13 @@ mod tests {
         assert_no_dashes(&line);
     }
 
-    /// The change itself: a section this dog cannot parse ends the loop
-    /// rather than being printed once an interval forever.
-    ///
     /// Through `poll` over a real socket, because which arm of the loop an
-    /// `Error::Config` takes is the entire behaviour under test. A test
-    /// that read the message alone would pass with the change reverted:
-    /// the old arm printed the same fault and went back round the loop.
+    /// `Error::Config` takes is the whole behaviour. Reading the message
+    /// cannot tell the arms apart: both print the same fault.
     ///
-    /// The timeout is the assertion. `poll` returns within one tick now;
-    /// before, it slept for `Config::default().interval` and asked again,
-    /// and waiting is the only way a test tells those two apart.
+    /// The timeout is the assertion. A loop that goes round again sleeps
+    /// for `Config::default().interval`, and waiting is the only way to
+    /// see it do that.
     #[tokio::test]
     async fn a_section_this_dog_cannot_parse_ends_the_poll_loop() {
         let dir = tempfile::tempdir().expect("a temporary directory");
