@@ -278,7 +278,7 @@ fn refused(daemon_version: Option<&str>, message: &str) -> ExitCode {
     ExitCode::FAILURE
 }
 
-/// Say why this dog is stopping on a `[<name>]` section it cannot read.
+/// Say why this dog is stopping on a `[<name>]` section it cannot use.
 ///
 /// The whole line, prefix included, so a caller prints one thing and is
 /// done. Returned rather than printed so a test can read it.
@@ -293,9 +293,10 @@ fn refused(daemon_version: Option<&str>, message: &str) -> ExitCode {
 /// The cost is self-healing: the fix now needs a `shep restart` as well.
 /// The one this names uses the section, which is the adopted name
 /// whenever a shepherd spawned the process. See [`Identity`].
-fn cannot_read_config(section: &str, source: &ConfigError) -> String {
+fn unusable_config(section: &str, source: &ConfigError) -> String {
     format!(
-        "shep-log-rotate: the [{section}] section in dogs.toml cannot be read: {source}. \
+        "shep-log-rotate: the [{section}] section in dogs.toml is not one this dog can use: \
+         {source}. \
          Nothing changes until somebody edits that file, so retrying would be this same \
          failure at this same interval, in the log this dog exists to keep small. Exiting, \
          so the shepherd reports a dog that is down rather than one that is up and rotating \
@@ -307,12 +308,12 @@ fn cannot_read_config(section: &str, source: &ConfigError) -> String {
 /// The poll loop.
 ///
 /// Three things end it: a signal, a refused handshake, and a `[<name>]`
-/// section this dog cannot parse. Every other failed tick is printed and
+/// section this dog cannot use. Every other failed tick is printed and
 /// retried on the next interval, because the shepherd restarting
 /// underneath a dog is ordinary rather than exceptional, and exiting would
 /// ask the supervisor to restart this process for a condition that
 /// resolves itself in a few seconds. A config fault is the opposite kind of
-/// failure and takes the opposite arm: see [`cannot_read_config`].
+/// failure and takes the opposite arm: see [`unusable_config`].
 ///
 /// A connection-shaped failure no longer drops the session, which is the
 /// one thing that changed when [`Live`] started holding a reconnecting
@@ -397,7 +398,7 @@ async fn poll(socket: &std::path::Path, identity: &Identity) -> ExitCode {
                 // The one tick failure worth stopping for, and the only
                 // one of these four the next interval cannot fix.
                 Err(Error::Config { section, source }) => {
-                    eprintln!("{}", cannot_read_config(&section, &source));
+                    eprintln!("{}", unusable_config(&section, &source));
                     return ExitCode::FAILURE;
                 }
                 Err(err) => eprintln!("shep-log-rotate: {err}"),
@@ -639,7 +640,7 @@ mod tests {
         // maintainer set it from lookout without either side saying so.
         let source = Config::from_toml("max_age = \"1d\"\n")
             .expect_err("shep's duration grammar has no day unit");
-        let line = cannot_read_config("weathervane", &source);
+        let line = unusable_config("weathervane", &source);
 
         assert!(line.contains("[weathervane]"), "{line}");
         assert!(
@@ -684,13 +685,13 @@ mod tests {
         let code = tokio::time::timeout(Duration::from_secs(10), poll(&socket, &identity))
             .await
             .expect(
-                "a section this dog cannot read must end the loop; retrying it is an \
+                "a section this dog cannot use must end the loop; retrying it is an \
                  infinite run of identical failures in the log this dog keeps small",
             );
         assert_eq!(
             format!("{code:?}"),
             format!("{:?}", ExitCode::FAILURE),
-            "a dog that stopped on a config it cannot read must not report success"
+            "a dog that stopped on a config it cannot use must not report success"
         );
     }
 

@@ -565,7 +565,7 @@ fn a_section_the_dog_cannot_parse_stops_the_process() {
     assert_eq!(
         status.code(),
         Some(1),
-        "a dog stopping on a config it cannot read exits ExitCode::FAILURE, which is 1"
+        "a dog stopping on a config it cannot use exits ExitCode::FAILURE, which is 1"
     );
     let said = shepherd.dog_stderr();
     for part in ["[log-rotate]", "dogs.toml", "max_age", "1d"] {
