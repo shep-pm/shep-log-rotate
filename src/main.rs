@@ -74,7 +74,7 @@ use shep_client::{
 };
 
 use crate::{
-    config::{Config, PRINT_CONFIG},
+    config::{Config, ConfigError, PRINT_CONFIG},
     error::Error,
     stop::Stop,
     tick::{Live, tick},
@@ -278,13 +278,57 @@ fn refused(daemon_version: Option<&str>, message: &str) -> ExitCode {
     ExitCode::FAILURE
 }
 
+/// Say why this dog is stopping on a `[<name>]` section it cannot read.
+///
+/// The whole line, prefix included, so a caller prints one thing and is
+/// done. Returned rather than printed because it is the one part of this
+/// decision a test can read.
+///
+/// This is [`refused`]'s argument with a different cause and the same
+/// shape. A value the config parser rejects is not a condition that
+/// resolves itself: nothing changes until somebody edits `dogs.toml`, so
+/// every retry is the same failure at the same interval, written into the
+/// log this dog exists to keep small.
+///
+/// Exiting is also the only way an operator finds out. A dog that keeps
+/// ticking on a section it cannot read still connects, still handshakes,
+/// still answers, and `shep list` goes on calling it online while it
+/// rotates nothing at all. The fault is in this dog's own log and nowhere
+/// else, so somebody has to already suspect it to go looking. A dog that
+/// is down says so by itself.
+///
+/// It costs the self-healing the retry arm had, and that is the trade
+/// rather than an oversight. A dog that retried picked up a corrected
+/// `dogs.toml` on its next tick and nobody had to do anything. This one
+/// exhausts the shepherd's restart budget in seconds and lands `Errored`,
+/// so correcting the typo now needs a `shep restart` as well. A wrong
+/// status nobody can see is worse than a right one somebody has to clear.
+///
+/// The `shep restart` it suggests names the section, which is the adopted
+/// name for every dog a shepherd spawned: see [`Identity`], where the two
+/// names part company only when nothing adopted this process, and in that
+/// case the reader started the binary by hand and can start it again the
+/// same way.
+fn cannot_read_config(section: &str, source: &ConfigError) -> String {
+    format!(
+        "shep-log-rotate: the [{section}] section in dogs.toml cannot be read: {source}. \
+         Nothing changes until somebody edits that file, so retrying would be this same \
+         failure at this same interval, in the log this dog exists to keep small. Exiting, \
+         so the shepherd reports a dog that is down rather than one that is up and rotating \
+         nothing. Fix [{section}] in dogs.toml and start this dog again: `shep restart \
+         {section}` if a shepherd adopted it."
+    )
+}
+
 /// The poll loop.
 ///
-/// Nothing in here is fatal except a signal and a refused handshake. A
-/// failed tick is printed and retried on the next interval, because the
-/// shepherd restarting underneath a dog is ordinary rather than
-/// exceptional, and exiting would ask the supervisor to restart this
-/// process for a condition that resolves itself in a few seconds.
+/// Three things end it: a signal, a refused handshake, and a `[<name>]`
+/// section this dog cannot parse. Every other failed tick is printed and
+/// retried on the next interval, because the shepherd restarting
+/// underneath a dog is ordinary rather than exceptional, and exiting would
+/// ask the supervisor to restart this process for a condition that
+/// resolves itself in a few seconds. A config fault is the opposite kind of
+/// failure and takes the opposite arm: see [`cannot_read_config`].
 ///
 /// A connection-shaped failure no longer drops the session, which is the
 /// one thing that changed when [`Live`] started holding a reconnecting
@@ -365,6 +409,12 @@ async fn poll(socket: &std::path::Path, identity: &Identity) -> ExitCode {
                     if let Some(line) = report.summary() {
                         println!("{line}");
                     }
+                }
+                // The one tick failure worth stopping for, and the only
+                // one of these four the next interval cannot fix.
+                Err(Error::Config { section, source }) => {
+                    eprintln!("{}", cannot_read_config(&section, &source));
+                    return ExitCode::FAILURE;
                 }
                 Err(err) => eprintln!("shep-log-rotate: {err}"),
             }
@@ -481,6 +531,8 @@ fn heads_up_the_real_shepherd_tier_is_not_running() {
 mod tests {
     use super::*;
     use crate::test_support::assert_no_dashes;
+    use core::time::Duration;
+    use shep_client::shep_core::protocol::Response;
 
     /// An environment holding exactly one variable, which is the only one
     /// [`Identity::from_env`] reads.
@@ -594,6 +646,95 @@ mod tests {
         let identity = Identity::from_env(only("SHEP_NAME", "production"));
         assert_eq!(identity.handshake, None);
         assert_eq!(identity.section, DEFAULT_NAME);
+    }
+
+    #[test]
+    fn the_config_refusal_names_the_section_the_fault_and_the_file_to_edit() {
+        // The value that started this. shep's duration grammar has no day
+        // unit at all, so a week is "168h" and "1d" is refused, and a
+        // maintainer set it from lookout without either side saying so.
+        let source = Config::from_toml("max_age = \"1d\"\n")
+            .expect_err("shep's duration grammar has no day unit");
+        let line = cannot_read_config("weathervane", &source);
+
+        assert!(line.contains("[weathervane]"), "{line}");
+        assert!(
+            !line.contains("log-rotate]"),
+            "the default section leaked into a dog adopted as something else: {line}"
+        );
+        assert!(
+            line.contains("dogs.toml"),
+            "an operator reading this has to be told which file to open: {line}"
+        );
+        assert!(line.contains("max_age") && line.contains("1d"), "{line}");
+        assert!(
+            line.contains("shep restart weathervane"),
+            "exiting costs the self-healing the retry arm had, so the line that spends it \
+             has to say how to get the dog back: {line}"
+        );
+        assert_no_dashes(&line);
+    }
+
+    /// The change itself: a section this dog cannot parse ends the loop
+    /// rather than being printed once an interval forever.
+    ///
+    /// Through `poll` over a real socket, because which arm of the loop an
+    /// `Error::Config` takes is the entire behaviour under test. A test
+    /// that read the message alone would pass with the change reverted:
+    /// the old arm printed the same fault and went back round the loop.
+    ///
+    /// The timeout is the assertion. `poll` returns within one tick now;
+    /// before, it slept for `Config::default().interval` and asked again,
+    /// and waiting is the only way a test tells those two apart.
+    #[tokio::test]
+    async fn a_section_this_dog_cannot_parse_ends_the_poll_loop() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let socket = shep_client::testing::control_address(dir.path());
+        let (_fake, _served) = shep_client::testing::fake_daemon_accepting_repeatedly(
+            &socket,
+            Response::DogSection {
+                toml: "max_age = \"1d\"\n".to_owned().into(),
+            },
+        );
+        let identity = Identity {
+            handshake: Some("weathervane".to_owned()),
+            section: "weathervane".to_owned(),
+        };
+
+        let code = tokio::time::timeout(Duration::from_secs(10), poll(&socket, &identity))
+            .await
+            .expect(
+                "a section this dog cannot read must end the loop; retrying it is an \
+                 infinite run of identical failures in the log this dog keeps small",
+            );
+        assert_eq!(
+            format!("{code:?}"),
+            format!("{:?}", ExitCode::FAILURE),
+            "a dog that stopped on a config it cannot read must not report success"
+        );
+    }
+
+    /// The other half of the same decision, and the reason this arm is
+    /// split rather than the whole loop made fatal. A shepherd restarting
+    /// underneath a dog answers nothing for a moment, and that resolves
+    /// itself without anybody editing a file.
+    #[tokio::test]
+    async fn a_socket_that_is_not_there_is_retried_rather_than_fatal() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        // Bound by nobody: every connect fails, which is what a dog started
+        // before its shepherd sees.
+        let socket = shep_client::testing::control_address(dir.path());
+        let identity = Identity {
+            handshake: Some("weathervane".to_owned()),
+            section: "weathervane".to_owned(),
+        };
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), poll(&socket, &identity))
+                .await
+                .is_err(),
+            "a dog whose socket is not up yet must keep waiting for it"
+        );
     }
 
     #[test]

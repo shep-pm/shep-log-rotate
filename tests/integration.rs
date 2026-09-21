@@ -192,6 +192,26 @@ impl DogProcess {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
+
+    /// Wait for this dog to exit on its own, and hand back how it exited.
+    ///
+    /// Polled rather than blocking on `wait`, so a dog that never stops
+    /// fails the test with a sentence instead of hanging the whole tier
+    /// until a CI timeout kills it with nothing to read.
+    ///
+    /// # Panics
+    /// If the dog is still running after [`PATIENCE`], which is the whole
+    /// assertion for a test about a dog that must stop.
+    fn wait_for_exit(&mut self) -> std::process::ExitStatus {
+        let deadline = Instant::now() + PATIENCE;
+        while Instant::now() < deadline {
+            if let Some(status) = self.0.try_wait().expect("the dog's exit status") {
+                return status;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("the dog is still running, so it went back round the loop instead of stopping");
+    }
 }
 
 impl Drop for DogProcess {
@@ -515,6 +535,51 @@ fn the_dog_reads_the_section_of_the_name_it_was_adopted_under() {
     );
     let counter = concatenated_counter(&files);
     assert_eq!(counter.first(), Some(&0));
+}
+
+#[test]
+fn a_section_the_dog_cannot_parse_stops_the_process() {
+    // Against a real shepherd because the fake one in the unit tier serves
+    // whatever text it is handed, and the question here is what a daemon
+    // does with a `dogs.toml` somebody hand-edited: it serves the section
+    // through without minding the value, and this dog is the only party
+    // that can tell the value is wrong.
+    //
+    // `1d` is the value from the incident. shep's duration grammar has no
+    // day unit at all, so a week is `168h`, and a dog that retried this
+    // handshook, answered, rotated nothing, and was reported online for as
+    // long as nobody read its own log.
+    let shepherd = Shepherd::new();
+    let idle = write_script(shepherd.home(), "idle.sh", "#!/bin/sh\nsleep 300\n");
+    shepherd.write_config("[log-rotate]\nmax_age = \"1d\"\n");
+
+    // A shepherd has to be up, since the fault only reaches this dog as an
+    // answer to `DogConfig`. A dog with no daemon to ask retries, which is
+    // the behaviour this test must not be confused by.
+    shepherd.ok(&[
+        "start",
+        idle.to_str().expect("script path"),
+        "--name",
+        "idle",
+        "--style",
+        "bare",
+    ]);
+
+    let mut dog = shepherd.spawn_dog();
+    let status = dog.wait_for_exit();
+
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "a dog stopping on a config it cannot read exits ExitCode::FAILURE, which is 1"
+    );
+    let said = shepherd.dog_stderr();
+    for part in ["[log-rotate]", "dogs.toml", "max_age", "1d"] {
+        assert!(
+            said.contains(part),
+            "the line an operator finds in the log has to name {part}: {said:?}"
+        );
+    }
 }
 
 #[test]

@@ -110,6 +110,15 @@ choice rather than something shep does for it: the shepherd serves the
 section fresh on every request and never pushes one, so a dog that asked
 only at startup would need bouncing.
 
+A value the dog cannot read is the exception, and it stops the dog rather
+than the pass. Nothing about a rejected `max_age` changes until somebody
+edits the file, so a dog that went back round the loop would write the same
+complaint into its own log every interval while `shep list` called it online
+and it rotated nothing at all. It prints what it could not read and exits
+instead, which the shepherd shows as a dog that is down. Fix the value and
+start it again with `shep restart log-rotate`, under whatever name you
+adopted it.
+
 `shep lookout` can edit the same table. Press `s` for the dog list, then `e`
 on this dog's row, and you get a form built from the schema `--schema`
 prints: one row per setting, with the two grammars above resolved, so a
