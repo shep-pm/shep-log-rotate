@@ -106,9 +106,9 @@ fn the_protocol_this_dog_announces_is_one_a_shepherd_still_accepts() {
     // protocol, and somebody has to run the integration tier against a
     // shepherd built from that release before changing the number here.
     assert_eq!(
-        announced, 8,
+        announced, 9,
         "this dog announces protocol {announced}, and this crate was last verified against a \
-         shepherd speaking 8. Run the integration tier against the new shep before moving this."
+         shepherd speaking 9. Run the integration tier against the new shep before moving this."
     );
     assert!(
         announced >= MIN_SUPPORTED,

@@ -18,7 +18,7 @@ use core::fmt;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use shep_client::{
-    dogs::DogConfig,
+    dogs::dog_config,
     shep_core::values::{MemSize, ParseMemSizeError, ParseUpDurationError, UpDuration},
 };
 
@@ -181,11 +181,20 @@ impl core::error::Error for ConfigError {
 /// renders as bytes and `interval = "10"` as milliseconds, which is what
 /// each of them actually is.
 ///
-/// `DogConfig` carries no `#[shep(secret)]`, because nothing in here is a
+/// Nothing here carries `#[shep(secret)]`, because nothing here is a
 /// credential: this dog is told about sizes and durations and never about
-/// where to send anything. The derive is still what lets `config_schema`
-/// publish the section at all, and a config type with nothing to mark still
-/// wants the impl.
+/// where to send anything. `#[dog_config]` is still what lets
+/// `config_schema` publish the section at all, and a config type with
+/// nothing to mark still wants the impl.
+///
+/// It sits above the derive list rather than inside it, and the order is
+/// load-bearing. The attribute works by rewriting the fields it marks, and
+/// rustc expands whatever is written above it first, so a `JsonSchema` built
+/// before the rewrite would never see the mark. shep refuses that order, but
+/// only for a type that marks something. Here it would compile and stay
+/// quiet, which is why the order is worth a paragraph rather than a
+/// compiler's word: the day a credential arrives in this section, the rule
+/// has to already be followed.
 ///
 /// Field docs are not decoration here. lookout shows a property's
 /// `description` beside it in the pane, on one line and clipped to the
@@ -205,7 +214,8 @@ impl core::error::Error for ConfigError {
 /// a hand-written impl to redact and no exact-string test to pin it with.
 /// [`Live`](crate::tick::Live) is the type in this crate that goes the other
 /// way, and it does so because it holds a socket path.
-#[derive(Debug, Deserialize, JsonSchema, DogConfig)]
+#[dog_config]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(
     title = "log-rotate",
@@ -488,19 +498,30 @@ interval = "5s"
         assert_eq!(header, "[log-rotate]");
     }
 
-    /// `probe` prints this to stdout for `--schema` and exits 0. The one way
-    /// it can fail is a `#[shep(secret)]` that landed on no property, and
-    /// then it prints the fault and exits 1 instead, which shep reads as a
-    /// dog with an unreadable schema. Nothing here is marked today, so this
-    /// is the guard for the day something is.
+    /// Nothing in this section is a credential, and this is what holds
+    /// [`Section`]'s doc comment to it. `#[dog_config]` writes
+    /// [`SECRET_KEY`](shep_client::dogs::SECRET_KEY) onto each field marked
+    /// `#[shep(secret)]`, at whatever depth `schemars` ends up putting that
+    /// field, so one mark anywhere under here reaches the rendered schema.
+    ///
+    /// There is nothing left to assert about publishing the schema at all.
+    /// `config_schema` cannot fail: it used to be handed a flat list of
+    /// marked field names and report the ones it could not find among the
+    /// properties, and the mark rides the field itself now.
     #[test]
-    fn the_schema_is_publishable() {
-        shep_client::dogs::config_schema::<Section>().expect("no marked field is missing");
+    fn the_schema_marks_nothing_as_a_credential() {
+        let rendered = shep_client::dogs::config_schema::<Section>()
+            .as_value()
+            .to_string();
+        assert!(
+            !rendered.contains(shep_client::dogs::SECRET_KEY),
+            "a field in this section is published as a credential: {rendered}"
+        );
     }
 
     /// The schema's property names, sorted.
     fn schema_keys() -> Vec<String> {
-        let schema = shep_client::dogs::config_schema::<Section>().expect("publishable");
+        let schema = shep_client::dogs::config_schema::<Section>();
         let mut keys: Vec<String> = schema
             .as_value()
             .get("properties")
@@ -544,7 +565,7 @@ interval = "5s"
         // "10"` as milliseconds. Inline the pattern and both read as raw
         // digits, which is exactly the confusion the two grammars exist to
         // settle.
-        let schema = shep_client::dogs::config_schema::<Section>().expect("publishable");
+        let schema = shep_client::dogs::config_schema::<Section>();
         let schema = schema.as_value();
 
         for (field, grammar) in [
@@ -574,7 +595,7 @@ interval = "5s"
         // schema is a `oneOf` of consts and makes an operator spell one whose
         // schema is a bare string, and `from_toml` refuses everything but
         // these two either way.
-        let schema = shep_client::dogs::config_schema::<Section>().expect("publishable");
+        let schema = shep_client::dogs::config_schema::<Section>();
         let choices: Vec<String> = schema
             .as_value()
             .pointer("/$defs/Naming/oneOf")
@@ -598,7 +619,7 @@ interval = "5s"
         // false` in the schema are the same rule stated twice, once for each
         // reader. Without the second one a pane offers to add a key that
         // `from_toml` then reports as a typo.
-        let schema = shep_client::dogs::config_schema::<Section>().expect("publishable");
+        let schema = shep_client::dogs::config_schema::<Section>();
         assert_eq!(
             schema.as_value().get("additionalProperties"),
             Some(&serde_json::Value::Bool(false))
@@ -612,7 +633,7 @@ interval = "5s"
         // schemars publishes a type's doc comment as its description, and
         // this file's doc comments are long on purpose and written for
         // whoever maintains it. `Section` and `Naming` both override theirs.
-        let schema = shep_client::dogs::config_schema::<Section>().expect("publishable");
+        let schema = shep_client::dogs::config_schema::<Section>();
         let rendered = schema.as_value().to_string();
         assert_no_dashes(&rendered);
         assert!(
