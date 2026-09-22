@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-22
+
+### Fixed
+
+- Stop the dog on a [<name>] section it cannot read **(BREAKING)**
+- Say the section cannot be used, not that it cannot be read
+
+
 ## [0.1.9] - 2026-09-19
 
 
