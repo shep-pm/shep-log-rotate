@@ -32,6 +32,7 @@ A log-rotation dog for shep. One binary, one poll loop, no library target.
 
 ## Style
 
+- Invoke the `rust-house-style` skill before writing or reviewing Rust. The rules are shep-pm/rust-house-style, IR-1..IR-48.
 - Doc comments here are long on purpose and explain the decision, not the syntax. Match that for new items rather than trimming to a one-liner.
 - `.coderabbit.yaml` restates the Rust rules reviewers hold this crate to. Read its `path_instructions` before touching `src/prune.rs` or `src/rotate.rs`.
 - Terminology: a `sheep` is one managed process, the plural is `flock`, dogs are plugin processes, the daemon is only ever "the shepherd".
