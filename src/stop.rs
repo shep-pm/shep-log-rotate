@@ -9,8 +9,12 @@
 //! stop requested before this base, and did one arrive while this base's
 //! gzip was running.
 //!
-//! The poll loop owns the signal. It turns ctrl-c into a request here, and
-//! watches the same request while it sleeps between ticks.
+//! The poll loop owns the signals. It turns ctrl-c and, on unix, the
+//! shepherd's `SIGTERM` into a request here, and watches the same request
+//! while it sleeps between ticks. `SIGTERM` has to be among them: it is how
+//! every supervised stop begins, and left at its default it would end the
+//! process between a rename and its reopen, the one window the tick never
+//! lets a stop cut.
 
 use tokio::sync::watch;
 
@@ -36,16 +40,50 @@ impl Stop {
         Self::new().0
     }
 
-    /// A stop that ctrl-c requests.
+    /// A stop that ctrl-c requests, and on unix `SIGTERM` as well.
     ///
-    /// The listener is a spawned task, so this needs a runtime. If the
-    /// handler cannot be installed the dog runs until the shepherd stops it,
-    /// which is how it ran before signals were watched at all, and a ctrl-c
-    /// then ends it the way the OS does with no handler in place: at once,
+    /// `SIGTERM` is the signal the shepherd's kill ladder sends first, to
+    /// every stop of a live dog, `shep dogs disable` included. With no
+    /// handler it takes its default disposition and the process is gone
+    /// wherever the tick happens to be, which can be between a rename and
+    /// the reopen that follows it. Turning it into the same request ctrl-c
+    /// makes lets the tick finish its renames and reopens, and the poll loop
+    /// then exits. The shepherd's `SIGKILL` at `kill_timeout` still
+    /// guarantees it gets its way, so nothing here argues with the
+    /// supervisor about who decides when this process ends.
+    ///
+    /// The listeners are registered before this returns, so a signal that
+    /// arrives after the call is never lost to a task that has not run yet.
+    /// The wait for one is a spawned task, so this needs a runtime. Each
+    /// listener fails on its own: if one cannot be installed the other still
+    /// works, and if neither can the dog runs until the shepherd stops it,
+    /// which is how it ran before signals were watched at all. A signal then
+    /// ends it the way the OS does with no handler in place: at once,
     /// without the tidy loop's chance to skip or abandon a gzip. Requesting
     /// a stop on that failure instead would exit a dog nobody asked to stop,
     /// and the shepherd would restart it into the same failure.
-    pub fn on_ctrl_c() -> Self {
+    #[cfg(unix)]
+    pub fn on_stop_signals() -> Self {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let (stop, request) = Self::new();
+        let mut interrupt = signal(SignalKind::interrupt()).ok();
+        let mut terminate = signal(SignalKind::terminate()).ok();
+        tokio::spawn(async move {
+            tokio::select! {
+                true = arrives(&mut interrupt) => request.request(),
+                true = arrives(&mut terminate) => request.request(),
+                else => {}
+            }
+        });
+        stop
+    }
+
+    /// A stop that ctrl-c requests. Windows has no `SIGTERM` to listen for,
+    /// and shep cannot deliver a signal there either, so this is all there
+    /// is to watch. See the unix version for the failure behaviour.
+    #[cfg(not(unix))]
+    pub fn on_stop_signals() -> Self {
         let (stop, request) = Self::new();
         tokio::spawn(async move {
             if tokio::signal::ctrl_c().await.is_ok() {
@@ -70,6 +108,16 @@ impl Stop {
         if self.0.wait_for(|&requested| requested).await.is_err() {
             core::future::pending::<()>().await;
         }
+    }
+}
+
+/// Whether `listener` heard its signal. A listener that never installed hears
+/// nothing, and one whose driver shut down is not a request either.
+#[cfg(unix)]
+async fn arrives(listener: &mut Option<tokio::signal::unix::Signal>) -> bool {
+    match listener {
+        Some(listener) => listener.recv().await.is_some(),
+        None => core::future::pending().await,
     }
 }
 
