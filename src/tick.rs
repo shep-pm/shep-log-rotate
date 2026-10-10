@@ -258,10 +258,14 @@ fn times(n: usize) -> String {
 ///    reopened would read a file mid-append and then delete what shep is
 ///    writing to.
 ///
-/// `stop` is consulted from the tidy loop and nowhere else. The renames and
-/// the reopens are quick, and a tick interrupted between a rename and its
-/// reopen leaves shep writing into a file with the wrong name, which is
-/// worse than the wait. The gzip of a large generation is the slow part: it
+/// `stop` is consulted at two places: before each sheep's turn in the
+/// rename loop, and in the tidy loop. Never between a rename and its reopen.
+/// Those are quick, and a tick interrupted between them leaves shep writing
+/// into a file with the wrong name, which is worse than the wait. Between
+/// sheep nothing is waiting on a reopen, so a stop there ends the rename
+/// loop: the shepherd's `SIGKILL` follows a stop by `kill_timeout`, and a
+/// flock with many qualifying sheep could otherwise still be renaming when
+/// it lands. The gzip of a large generation is the slow part: it
 /// runs on a blocking thread, a stop already requested when its turn comes
 /// skips it, and a stop arriving while it runs abandons it. The half-written
 /// `.gz` an abandoned gzip leaves is the state the next pass recovers from.
@@ -409,6 +413,17 @@ pub async fn tick<D: Daemon>(
     let mut not_reopened: Vec<usize> = Vec::new();
 
     for (position, name) in order.iter().enumerate() {
+        // The one stop check outside the tidy loop, and only here: between
+        // sheep, where the last one is reopened and this one is untouched,
+        // so nothing is waiting on a reopen. A stop is the first half of the
+        // shepherd's kill ladder, and its `SIGKILL` follows at
+        // `kill_timeout` wherever the tick is. Starting another sheep's
+        // rename then would risk that cut landing between the rename and
+        // its reopen. Leaving the sheep alone costs one interval, since the
+        // next tick finds its log still over the limit.
+        if stop.requested() {
+            break;
+        }
         let mut rotated_any = false;
         let mut rotated_here: Vec<LogPath> = Vec::new();
         for base in &groups[name] {
@@ -1425,15 +1440,24 @@ mod tests {
         // The renames and the reopen are quick and must not be interrupted:
         // a sheep left between the two writes into a file with the wrong
         // name. The gzip afterwards is the slow part, and a stop already
-        // requested when the tidy loop starts means none of it runs.
+        // requested when the tidy loop starts means none of it runs. The
+        // stop lands during the reopen, the latest point a sheep's own
+        // rename and reopen can see it.
         let dir = tempfile::tempdir().expect("tempdir");
         let out = dir.path().join("web-0-out.log");
         fs::write(&out, "x".repeat(2048)).expect("seeded");
         let older = dir.path().join("web-0-out.2026-08-20T15-04-01.log");
         fs::write(&older, "would be gzipped\n").expect("seeded");
-        let fake = Fake::new("max_size = \"1K\"\n", vec![sheep("web", Some(&out), None)]);
         let (mut stop, request) = Stop::new();
-        request.request();
+        let request = RefCell::new(Some(request));
+        let fake = Fake {
+            on_reopen: Some(Box::new(move |_name| {
+                if let Some(request) = request.borrow_mut().take() {
+                    request.request();
+                }
+            })),
+            ..Fake::new("max_size = \"1K\"\n", vec![sheep("web", Some(&out), None)])
+        };
 
         let (_config, report) = tick(&fake, "log-rotate", SystemTime::now(), &mut stop)
             .await
@@ -1452,6 +1476,46 @@ mod tests {
                 .join("web-0-out.2026-08-20T15-04-01.log.gz")
                 .exists()
         );
+    }
+
+    #[tokio::test]
+    async fn a_stop_requested_between_two_sheep_leaves_the_second_unrotated() {
+        // The stop lands while the first sheep is being reopened, so that
+        // sheep's rename and reopen are done and nothing is waiting for a
+        // reopen. The second sheep qualifies too, but starting its rename
+        // now would open a window the shepherd's SIGKILL could cut, with no
+        // way to know how long the stop has left. It waits for the next
+        // dog, and its log is still where shep is writing it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = dir.path().join("api-0-out.log");
+        let second = dir.path().join("web-0-out.log");
+        fs::write(&first, "x".repeat(2048)).expect("seeded");
+        fs::write(&second, "x".repeat(2048)).expect("seeded");
+        let (mut stop, request) = Stop::new();
+        let request = RefCell::new(Some(request));
+        let fake = Fake {
+            on_reopen: Some(Box::new(move |_name| {
+                if let Some(request) = request.borrow_mut().take() {
+                    request.request();
+                }
+            })),
+            ..Fake::new(
+                "max_size = \"1K\"\n",
+                vec![
+                    sheep("api", Some(&first), None),
+                    sheep("web", Some(&second), None),
+                ],
+            )
+        };
+
+        let (_config, report) = tick(&fake, "log-rotate", SystemTime::now(), &mut stop)
+            .await
+            .expect("ticked");
+
+        assert_eq!(report.rotated, 1, "only the first sheep was rotated");
+        assert!(!first.exists(), "api was renamed and reopened in full");
+        assert_eq!(*fake.reopened.borrow(), vec!["api".to_owned()]);
+        assert!(second.exists(), "web was never renamed, so never orphaned");
     }
 
     #[test]

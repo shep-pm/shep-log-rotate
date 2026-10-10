@@ -5,9 +5,10 @@
 //! else is a stat, a rename or a socket request, and a tick that is
 //! interrupted between a rename and the reopen that follows it leaves shep
 //! writing into a file with the wrong name, which is worse than the wait.
-//! So the tick asks this type two things, and only from its tidy loop: is a
-//! stop requested before this base, and did one arrive while this base's
-//! gzip was running.
+//! So the tick asks this type three things, and only at those points: is a
+//! stop requested before this sheep's turn to be renamed, where the last
+//! sheep is already reopened; is one requested before this base is tidied;
+//! and did one arrive while this base's gzip was running.
 //!
 //! The poll loop owns the signals. It turns ctrl-c and, on unix, the
 //! shepherd's `SIGTERM` into a request here, and watches the same request
