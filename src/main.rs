@@ -326,16 +326,21 @@ fn unusable_config(section: &str, source: &ConfigError) -> String {
 /// really about: the first connection, which nothing supervises and which
 /// fails whenever this dog is started before the socket exists.
 ///
-/// There is no signal handling beyond `ctrl_c`, which is the clean-exit path
-/// for an operator running this in a terminal. It is honoured between
-/// ticks, and during a tick only while a generation is being gzipped: see
-/// [`tick()`] for why the rest of a tick runs to completion. The shepherd
-/// owns this process's signals and its kill ladder. Rotation on `SIGHUP` is
-/// a shape people expect from `logrotate`, and adding it here would be
-/// arguing with the supervisor about who decides when this process does
-/// work.
+/// The only signals handled are the two that mean stop: ctrl-c, the
+/// clean-exit path for an operator running this in a terminal, and on unix
+/// `SIGTERM`, which is how the shepherd's kill ladder begins every stop of a
+/// live dog. Both are honoured between ticks, and during a tick only between
+/// one sheep's turn and the next, before each tidy base, and while a
+/// generation is being gzipped: see [`tick()`] for why the rest of a tick
+/// runs to completion. `SIGTERM` has to be one of them, because left at its
+/// default it would end the process between a rename and its reopen, and
+/// nothing else would ever ask shep to reopen. Handling it does not argue
+/// with the shepherd about when this process ends: its `SIGKILL` at
+/// `kill_timeout` still decides that. Rotation on `SIGHUP` is a shape people
+/// expect from `logrotate`, and adding it here would be arguing with the
+/// supervisor about who decides when this process does work.
 async fn poll(socket: &std::path::Path, identity: &Identity) -> ExitCode {
-    let mut stop = Stop::on_ctrl_c();
+    let mut stop = Stop::on_stop_signals();
     // The interval to wait when there is no session to read one from. A
     // disconnected dog has no configuration either, so the default is the
     // only honest answer, and it is also the retry delay.
@@ -480,7 +485,7 @@ fn main() -> ExitCode {
 
     // Built by hand rather than through `#[tokio::main]` for the line after
     // the poll. Dropping a runtime waits for every blocking task it started,
-    // and a gzip abandoned on ctrl-c is one of those, so the exit would wait
+    // and a gzip abandoned on a stop is one of those, so the exit would wait
     // out the compression the operator just asked it not to. Shutting down
     // in the background leaves that thread to die with the process; the
     // half-written `.gz` it leaves is what the next pass overwrites.

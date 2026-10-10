@@ -258,10 +258,18 @@ fn times(n: usize) -> String {
 ///    reopened would read a file mid-append and then delete what shep is
 ///    writing to.
 ///
-/// `stop` is consulted from the tidy loop and nowhere else. The renames and
-/// the reopens are quick, and a tick interrupted between a rename and its
-/// reopen leaves shep writing into a file with the wrong name, which is
-/// worse than the wait. The gzip of a large generation is the slow part: it
+/// `stop` is consulted at two places: before each sheep's turn in the
+/// rename loop, and in the tidy loop. Never between a rename and its reopen.
+/// Those are quick, and a tick interrupted between them leaves shep writing
+/// into a file with the wrong name, which is worse than the wait. Between
+/// sheep nothing is waiting on a reopen, so a stop there ends the renaming:
+/// the shepherd's `SIGKILL` follows a stop by `kill_timeout`, and a flock
+/// with many qualifying sheep could otherwise still be renaming when it
+/// lands. The remaining sheep still get their turn, but a stopping turn
+/// renames nothing and only reopens a sheep whose file an earlier sheep
+/// already renamed, because that sheep would otherwise write into the
+/// renamed generation for good. The gzip of a large generation is the slow
+/// part: it
 /// runs on a blocking thread, a stop already requested when its turn comes
 /// skips it, and a stop arriving while it runs abandons it. The half-written
 /// `.gz` an abandoned gzip leaves is the state the next pass recovers from.
@@ -409,6 +417,21 @@ pub async fn tick<D: Daemon>(
     let mut not_reopened: Vec<usize> = Vec::new();
 
     for (position, name) in order.iter().enumerate() {
+        // The one stop check outside the tidy loop, and only here: between
+        // sheep, where the last one's turn is complete and this one's has
+        // not begun, so nothing is waiting on a reopen. A stop is the first
+        // half of the shepherd's kill ladder, and its `SIGKILL` follows at
+        // `kill_timeout` wherever the tick is. Starting another rename then
+        // would risk that cut landing between the rename and its reopen, so
+        // a stopping turn renames nothing. Leaving a log alone costs one
+        // interval, since the next tick finds it still over the limit.
+        //
+        // The turn is not skipped, though. A sheep sharing a path that an
+        // earlier sheep already renamed is writing into that renamed file
+        // through its own descriptor, and only this dog ever asks shep to
+        // reopen it, so it still gets the reopen it needs. That costs one
+        // request and starts no rename.
+        let stopping = stop.requested();
         let mut rotated_any = false;
         let mut rotated_here: Vec<LogPath> = Vec::new();
         for base in &groups[name] {
@@ -422,6 +445,9 @@ pub async fn tick<D: Daemon>(
                 // This one is still writing through its own descriptor, so
                 // it still needs the reopen below.
                 rotated_any = true;
+                continue;
+            }
+            if stopping {
                 continue;
             }
             if collides_with_a_live_log(base, &dir, config.naming, &protected) {
@@ -788,6 +814,8 @@ mod tests {
     use crate::test_support::assert_no_dashes;
     use shep_client::shep_core::status::ProcStatus;
     use std::cell::RefCell;
+
+    mod stop;
 
     /// `Live`'s `Debug` is written rather than derived so a socket path under
     /// somebody's home directory cannot reach a log or a bug report. Proven
@@ -1418,102 +1446,6 @@ mod tests {
             !dir.path().join("api-0-out.log.2").exists(),
             "the old generation, shifted to .2, was past keep = 1 and went"
         );
-    }
-
-    #[tokio::test]
-    async fn a_stop_requested_before_the_tidy_skips_it() {
-        // The renames and the reopen are quick and must not be interrupted:
-        // a sheep left between the two writes into a file with the wrong
-        // name. The gzip afterwards is the slow part, and a stop already
-        // requested when the tidy loop starts means none of it runs.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let out = dir.path().join("web-0-out.log");
-        fs::write(&out, "x".repeat(2048)).expect("seeded");
-        let older = dir.path().join("web-0-out.2026-08-20T15-04-01.log");
-        fs::write(&older, "would be gzipped\n").expect("seeded");
-        let fake = Fake::new("max_size = \"1K\"\n", vec![sheep("web", Some(&out), None)]);
-        let (mut stop, request) = Stop::new();
-        request.request();
-
-        let (_config, report) = tick(&fake, "log-rotate", SystemTime::now(), &mut stop)
-            .await
-            .expect("ticked");
-
-        assert_eq!(report.rotated, 1, "the rename still happened");
-        assert_eq!(
-            *fake.reopened.borrow(),
-            vec!["web".to_owned()],
-            "and the reopen"
-        );
-        assert_eq!(report.compressed, 0, "but nothing was compressed");
-        assert!(older.exists(), "the older generation is still plain");
-        assert!(
-            !dir.path()
-                .join("web-0-out.2026-08-20T15-04-01.log.gz")
-                .exists()
-        );
-    }
-
-    #[test]
-    fn a_stop_requested_during_a_gzip_abandons_it() {
-        // 16 MiB of noise takes a release build the better part of a
-        // hundred milliseconds to deflate and a debug build far longer. The
-        // stop arrives after twenty, and the tick must come back on the
-        // stop rather than on the gzip. The runtime is built by hand so the
-        // directory outlives the abandoned thread: the runtime's drop waits
-        // for it, and the tempdir goes after that.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let out = dir.path().join("web-0-out.log");
-        fs::write(&out, "x".repeat(2048)).expect("seeded");
-        let mut noise = vec![0u8; 16 << 20];
-        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
-        for byte in &mut noise {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            *byte = state as u8;
-        }
-        let older = dir.path().join("web-0-out.2026-08-20T15-04-01.log");
-        fs::write(&older, &noise).expect("seeded");
-        drop(noise);
-        let fake = Fake::new("max_size = \"1K\"\n", vec![sheep("web", Some(&out), None)]);
-
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("a runtime");
-        let (report, took) = runtime.block_on(async {
-            let (mut stop, request) = Stop::new();
-            tokio::spawn(async move {
-                tokio::time::sleep(core::time::Duration::from_millis(20)).await;
-                request.request();
-            });
-            let started = std::time::Instant::now();
-            let (_config, report) = tick(&fake, "log-rotate", SystemTime::now(), &mut stop)
-                .await
-                .expect("ticked");
-            (report, started.elapsed())
-        });
-
-        assert_eq!(report.rotated, 1);
-        assert_eq!(report.compressed, 0, "the gzip was abandoned, not counted");
-        assert!(
-            dir.path()
-                .join("web-0-out.2026-08-20T15-04-01.log.gz")
-                .exists(),
-            "the gzip had started: its target was created before the stop arrived"
-        );
-        assert!(
-            took < core::time::Duration::from_millis(1500),
-            "the tick waited for the gzip rather than the stop: {took:?}"
-        );
-        // Dropping the runtime waits for the abandoned thread, which in
-        // this process nothing cuts off: it finishes the gzip it was
-        // running and removes the plain file, as it would have unabandoned.
-        // The real binary shuts the runtime down in the background instead
-        // and exits, and that is where the plain file survives.
-        drop(runtime);
-        assert!(!older.exists(), "left to run, the thread finished its job");
     }
 
     #[tokio::test]
