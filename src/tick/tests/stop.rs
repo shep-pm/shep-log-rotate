@@ -6,6 +6,18 @@
 
 use super::*;
 
+/// A reopen hook that requests the stop the first time any sheep is
+/// reopened, so the stop lands after that sheep's rename and before the next
+/// sheep's turn.
+fn stop_on_first_reopen(request: crate::stop::Request) -> Option<Hook> {
+    let request = RefCell::new(Some(request));
+    Some(Box::new(move |_name| {
+        if let Some(request) = request.borrow_mut().take() {
+            request.request();
+        }
+    }))
+}
+
 #[tokio::test]
 async fn a_stop_requested_before_the_tidy_skips_it() {
     // The renames and the reopen are quick and must not be interrupted:
@@ -17,16 +29,11 @@ async fn a_stop_requested_before_the_tidy_skips_it() {
     let dir = tempfile::tempdir().expect("tempdir");
     let out = dir.path().join("web-0-out.log");
     fs::write(&out, "x".repeat(2048)).expect("seeded");
-    let older = dir.path().join("web-0-out.2026-08-20T15-04-01.log");
+    let older = dir.path().join("web-0-out.2020-01-01T00-00-01.log");
     fs::write(&older, "would be gzipped\n").expect("seeded");
     let (mut stop, request) = Stop::new();
-    let request = RefCell::new(Some(request));
     let fake = Fake {
-        on_reopen: Some(Box::new(move |_name| {
-            if let Some(request) = request.borrow_mut().take() {
-                request.request();
-            }
-        })),
+        on_reopen: stop_on_first_reopen(request),
         ..Fake::new("max_size = \"1K\"\n", vec![sheep("web", Some(&out), None)])
     };
 
@@ -44,7 +51,7 @@ async fn a_stop_requested_before_the_tidy_skips_it() {
     assert!(older.exists(), "the older generation is still plain");
     assert!(
         !dir.path()
-            .join("web-0-out.2026-08-20T15-04-01.log.gz")
+            .join("web-0-out.2020-01-01T00-00-01.log.gz")
             .exists()
     );
 }
@@ -63,13 +70,8 @@ async fn a_stop_requested_between_two_sheep_leaves_the_second_unrotated() {
     fs::write(&first, "x".repeat(2048)).expect("seeded");
     fs::write(&second, "x".repeat(2048)).expect("seeded");
     let (mut stop, request) = Stop::new();
-    let request = RefCell::new(Some(request));
     let fake = Fake {
-        on_reopen: Some(Box::new(move |_name| {
-            if let Some(request) = request.borrow_mut().take() {
-                request.request();
-            }
-        })),
+        on_reopen: stop_on_first_reopen(request),
         ..Fake::new(
             "max_size = \"1K\"\n",
             vec![
@@ -87,6 +89,42 @@ async fn a_stop_requested_between_two_sheep_leaves_the_second_unrotated() {
     assert!(!first.exists(), "api was renamed and reopened in full");
     assert_eq!(*fake.reopened.borrow(), vec!["api".to_owned()]);
     assert!(second.exists(), "web was never renamed, so never orphaned");
+}
+
+#[tokio::test]
+async fn a_stop_requested_after_a_rename_still_reopens_the_sheep_sharing_that_file() {
+    // Two sheep, one log path (`merge_logs`, or a multi-instance
+    // `out_file`). The first sheep's turn renames it, and the stop lands
+    // during that sheep's reopen. The second sheep is still writing through
+    // its own descriptor into what is now a renamed generation, and only
+    // this dog ever asks shep to reopen it, so skipping its turn would
+    // leave it there for good. It starts no rename of its own, only the
+    // reopen it already needs.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let shared = dir.path().join("web-out.log");
+    fs::write(&shared, "x".repeat(2048)).expect("seeded");
+    let (mut stop, request) = Stop::new();
+    let fake = Fake {
+        on_reopen: stop_on_first_reopen(request),
+        ..Fake::new(
+            "max_size = \"1K\"\n",
+            vec![
+                sheep("web-0", Some(&shared), None),
+                sheep("web-1", Some(&shared), None),
+            ],
+        )
+    };
+
+    let (_config, report) = tick(&fake, "log-rotate", SystemTime::now(), &mut stop)
+        .await
+        .expect("ticked");
+
+    assert_eq!(report.rotated, 1, "one path, one rename");
+    assert_eq!(
+        *fake.reopened.borrow(),
+        vec!["web-0".to_owned(), "web-1".to_owned()],
+        "the second sheep shares a renamed file, so it is reopened despite the stop"
+    );
 }
 
 #[test]
@@ -108,7 +146,7 @@ fn a_stop_requested_during_a_gzip_abandons_it() {
         state ^= state << 17;
         *byte = state as u8;
     }
-    let older = dir.path().join("web-0-out.2026-08-20T15-04-01.log");
+    let older = dir.path().join("web-0-out.2020-01-01T00-00-01.log");
     fs::write(&older, &noise).expect("seeded");
     drop(noise);
     let fake = Fake::new("max_size = \"1K\"\n", vec![sheep("web", Some(&out), None)]);
@@ -134,7 +172,7 @@ fn a_stop_requested_during_a_gzip_abandons_it() {
     assert_eq!(report.compressed, 0, "the gzip was abandoned, not counted");
     assert!(
         dir.path()
-            .join("web-0-out.2026-08-20T15-04-01.log.gz")
+            .join("web-0-out.2020-01-01T00-00-01.log.gz")
             .exists(),
         "the gzip had started: its target was created before the stop arrived"
     );

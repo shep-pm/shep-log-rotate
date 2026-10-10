@@ -330,9 +330,9 @@ fn unusable_config(section: &str, source: &ConfigError) -> String {
 /// clean-exit path for an operator running this in a terminal, and on unix
 /// `SIGTERM`, which is how the shepherd's kill ladder begins every stop of a
 /// live dog. Both are honoured between ticks, and during a tick only between
-/// one sheep's reopen and the next sheep's rename and while a generation is
-/// being gzipped: see [`tick()`] for why the rest of a tick runs to
-/// completion. `SIGTERM` has to be one of them, because left at its
+/// one sheep's turn and the next, before each tidy base, and while a
+/// generation is being gzipped: see [`tick()`] for why the rest of a tick
+/// runs to completion. `SIGTERM` has to be one of them, because left at its
 /// default it would end the process between a rename and its reopen, and
 /// nothing else would ever ask shep to reopen. Handling it does not argue
 /// with the shepherd about when this process ends: its `SIGKILL` at

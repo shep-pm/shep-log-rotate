@@ -6,8 +6,8 @@
 //! interrupted between a rename and the reopen that follows it leaves shep
 //! writing into a file with the wrong name, which is worse than the wait.
 //! So the tick asks this type three things, and only at those points: is a
-//! stop requested before this sheep's turn to be renamed, where the last
-//! sheep is already reopened; is one requested before this base is tidied;
+//! stop requested before this sheep's turn, where the last turn is
+//! complete and a stopping turn renames nothing; is one requested before this base is tidied;
 //! and did one arrive while this base's gzip was running.
 //!
 //! The poll loop owns the signals. It turns ctrl-c and, on unix, the

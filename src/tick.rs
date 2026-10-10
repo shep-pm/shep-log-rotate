@@ -262,10 +262,14 @@ fn times(n: usize) -> String {
 /// rename loop, and in the tidy loop. Never between a rename and its reopen.
 /// Those are quick, and a tick interrupted between them leaves shep writing
 /// into a file with the wrong name, which is worse than the wait. Between
-/// sheep nothing is waiting on a reopen, so a stop there ends the rename
-/// loop: the shepherd's `SIGKILL` follows a stop by `kill_timeout`, and a
-/// flock with many qualifying sheep could otherwise still be renaming when
-/// it lands. The gzip of a large generation is the slow part: it
+/// sheep nothing is waiting on a reopen, so a stop there ends the renaming:
+/// the shepherd's `SIGKILL` follows a stop by `kill_timeout`, and a flock
+/// with many qualifying sheep could otherwise still be renaming when it
+/// lands. The remaining sheep still get their turn, but a stopping turn
+/// renames nothing and only reopens a sheep whose file an earlier sheep
+/// already renamed, because that sheep would otherwise write into the
+/// renamed generation for good. The gzip of a large generation is the slow
+/// part: it
 /// runs on a blocking thread, a stop already requested when its turn comes
 /// skips it, and a stop arriving while it runs abandons it. The half-written
 /// `.gz` an abandoned gzip leaves is the state the next pass recovers from.
@@ -414,16 +418,20 @@ pub async fn tick<D: Daemon>(
 
     for (position, name) in order.iter().enumerate() {
         // The one stop check outside the tidy loop, and only here: between
-        // sheep, where the last one is reopened and this one is untouched,
-        // so nothing is waiting on a reopen. A stop is the first half of the
-        // shepherd's kill ladder, and its `SIGKILL` follows at
-        // `kill_timeout` wherever the tick is. Starting another sheep's
-        // rename then would risk that cut landing between the rename and
-        // its reopen. Leaving the sheep alone costs one interval, since the
-        // next tick finds its log still over the limit.
-        if stop.requested() {
-            break;
-        }
+        // sheep, where the last one's turn is complete and this one's has
+        // not begun, so nothing is waiting on a reopen. A stop is the first
+        // half of the shepherd's kill ladder, and its `SIGKILL` follows at
+        // `kill_timeout` wherever the tick is. Starting another rename then
+        // would risk that cut landing between the rename and its reopen, so
+        // a stopping turn renames nothing. Leaving a log alone costs one
+        // interval, since the next tick finds it still over the limit.
+        //
+        // The turn is not skipped, though. A sheep sharing a path that an
+        // earlier sheep already renamed is writing into that renamed file
+        // through its own descriptor, and only this dog ever asks shep to
+        // reopen it, so it still gets the reopen it needs. That costs one
+        // request and starts no rename.
+        let stopping = stop.requested();
         let mut rotated_any = false;
         let mut rotated_here: Vec<LogPath> = Vec::new();
         for base in &groups[name] {
@@ -437,6 +445,9 @@ pub async fn tick<D: Daemon>(
                 // This one is still writing through its own descriptor, so
                 // it still needs the reopen below.
                 rotated_any = true;
+                continue;
+            }
+            if stopping {
                 continue;
             }
             if collides_with_a_live_log(base, &dir, config.naming, &protected) {
