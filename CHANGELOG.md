@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-10-10
+
+### Fixed
+
+- Treat SIGTERM as a stop so a supervised stop cannot cut a rename from its reopen
+- Stop renaming further sheep once a stop is requested
+- Reopen a sheep sharing a renamed file even when a stop is requested
+
+
 ## [0.2.1] - 2026-09-22
 
 ### Changed
