@@ -815,6 +815,7 @@ mod tests {
     use shep_client::shep_core::status::ProcStatus;
     use std::cell::RefCell;
 
+    mod reconnect;
     mod stop;
 
     /// `Live`'s `Debug` is written rather than derived so a socket path under
