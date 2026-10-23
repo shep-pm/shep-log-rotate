@@ -48,7 +48,8 @@ use std::{
 };
 
 use shep_client::{
-    LinkState, ReconnectingClient,
+    LinkState,
+    dogs::DogRuntime,
     shep_core::protocol::{ProcessInfo, Request, Response, SelectorSpec},
 };
 
@@ -83,9 +84,9 @@ pub trait Daemon {
     /// case for a dog running on its defaults.
     ///
     /// # Errors
-    /// [`Error::Connect`] or [`Error::Request`] if the shepherd cannot be
-    /// reached or refuses, and [`Error::Protocol`] if it answers with
-    /// something other than a dog section.
+    /// [`Error::Shepherd`] if the shepherd cannot be reached or refuses, and
+    /// [`Error::Protocol`] if it answers with something other than a dog
+    /// section.
     async fn dog_config(&self, name: &str) -> Result<String, Error>;
 
     /// Every supervised entry, dogs included.
@@ -278,11 +279,11 @@ fn times(n: usize) -> String {
 /// - [`Error::Config`] if the `[<name>]` section cannot be understood.
 ///   Nothing is touched in that case; the tick reads the config first for
 ///   exactly that reason.
-/// - [`Error::Connect`], [`Error::Request`] or [`Error::Protocol`] if the
-///   config or the flock listing cannot be had. A refused *reopen* is not an
-///   error: it is reported in [`Report::reopen_failed`], because shep is
-///   still writing into the renamed file through its existing descriptor, so
-///   nothing is lost and the next successful reopen recovers.
+/// - [`Error::Shepherd`] or [`Error::Protocol`] if the config or the flock
+///   listing cannot be had. A refused *reopen* is not an error: it is
+///   reported in [`Report::reopen_failed`], because shep is still writing into
+///   the renamed file through its existing descriptor, so nothing is lost and
+///   the next successful reopen recovers.
 ///
 /// A fault on disk is never an error from here: a rename, a compression, a
 /// deletion or a directory listing that fails is that one log's problem,
@@ -709,26 +710,37 @@ fn collides_with_a_live_log(
         .any(|name| match_generation(base, naming, name).is_some())
 }
 
-/// [`Daemon`] over a real connection to the shepherd.
+/// [`Daemon`] over a live session with the shepherd.
 ///
-/// A [`ReconnectingClient`] rather than a plain `Client`, because a dog
-/// outlives the daemon it connected to: shep hands over to a successor and
-/// the dog is still running with a dead socket in its hand. The reconnect
-/// is the client's own business, so nothing above this type reconnects.
+/// A [`DogRuntime`] rather than a bare [`Client`](shep_client::Client), because
+/// a dog outlives the
+/// daemon it connected to: shep hands over to a successor and the dog is still
+/// running with a dead socket in its hand. `DogRuntime` holds the
+/// [`ReconnectingClient`](shep_client::ReconnectingClient) that survives that,
+/// and the reconnect is the client's own business, so nothing above this type
+/// reconnects. See `tick::tests::reconnect` for the tick that proves it.
+///
+/// The section `DogRuntime` read on the way in is not what a tick runs on.
+/// [`Daemon::dog_config`] asks again on every tick, because the daemon re-reads
+/// its own side per request and a dog that served the startup answer out of
+/// memory would undo that: changing `max_size` would need a `shep disable` and
+/// a `shep enable` rather than taking effect on the next tick.
 ///
 /// `Debug` is written rather than derived, and it prints nothing about the
-/// connection. [`ReconnectingClient`]'s own `Debug` carries its socket path,
-/// which is `$SHEP_HOME/run/shep.sock` and so usually sits under somebody's
-/// home directory. This is a `pub` type, so a consumer that logged one, or a
-/// `#[derive(Debug)]` on a struct that held one, would put that path
-/// somewhere an operator later pastes into a bug report. None of the four
-/// fields helps: the socket comes from the environment, the announced name is
-/// already in every message this dog writes, and the link state and handshake
-/// ack are both readable from the client itself when they are wanted.
+/// session. [`ReconnectingClient`](shep_client::ReconnectingClient)'s own
+/// `Debug` carries its socket path, which
+/// is `$SHEP_HOME/run/shep.sock` and so usually sits under somebody's home
+/// directory, and `DogRuntime`'s carries the identity and the section's length.
+/// Neither is worth printing here: this is a `pub` type, so a consumer that
+/// logged one, or a `#[derive(Debug)]` on a struct that held one, would put
+/// that path somewhere an operator later pastes into a bug report. The socket
+/// comes from the environment, the announced name is already in every message
+/// this dog writes, and the link state and the section are both readable from
+/// the runtime itself when they are wanted.
 ///
 /// Pinned by `debug_says_nothing_about_the_connection`, because a later
 /// `#[derive(Debug)]` here would be a silent regression.
-pub struct Live(ReconnectingClient);
+pub struct Live(DogRuntime);
 
 impl fmt::Debug for Live {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -737,10 +749,10 @@ impl fmt::Debug for Live {
 }
 
 impl Live {
-    /// Wrap a connected client.
+    /// Wrap a session opened by [`DogRuntime::start`](shep_client::dogs::DogRuntime::start).
     #[must_use]
-    pub fn new(client: ReconnectingClient) -> Self {
-        Self(client)
+    pub fn new(runtime: DogRuntime) -> Self {
+        Self(runtime)
     }
 
     /// What the client's supervisor is doing right now.
@@ -750,23 +762,23 @@ impl Live {
     /// asks a real one. See `main::poll` for what it does with the answer.
     #[must_use]
     pub fn link(&self) -> LinkState {
-        self.0.link()
+        self.0.client().link()
     }
 }
 
 impl Daemon for Live {
     async fn dog_config(&self, name: &str) -> Result<String, Error> {
-        let asked = Request::DogConfig {
-            name: name.to_owned(),
-        };
-        match self.0.request(asked).await? {
-            Response::DogSection { toml } => Ok(toml.as_str().to_owned()),
-            other => Err(unexpected("DogConfig", &other)),
-        }
+        // `Client::dog_config` rather than the plain `Request::DogConfig`:
+        // it asks `Request::DogConfigResolved`, which is what lets an
+        // operator write a `{{secret:...}}` reference into this dog's section
+        // and have the shepherd expand it before handing the section over. A
+        // shepherd too old for that request is answered the plain one by the
+        // client itself, so this dog still runs against one.
+        Ok(self.0.client().dog_config(name).await?.as_str().to_owned())
     }
 
     async fn list_flock(&self) -> Result<Vec<ProcessInfo>, Error> {
-        match self.0.request(Request::ListFlock).await? {
+        match self.0.client().request(Request::ListFlock).await? {
             Response::Flock(flock) => Ok(flock),
             other => Err(unexpected("ListFlock", &other)),
         }
@@ -776,7 +788,7 @@ impl Daemon for Live {
         let asked = Request::Reopen {
             selector: SelectorSpec::Name(name.to_owned()),
         };
-        match self.0.request(asked).await? {
+        match self.0.client().request(asked).await? {
             Response::Reopened(_) => Ok(()),
             other => Err(unexpected("Reopen", &other)),
         }
@@ -815,36 +827,9 @@ mod tests {
     use shep_client::shep_core::status::ProcStatus;
     use std::cell::RefCell;
 
+    mod live;
+    mod reconnect;
     mod stop;
-
-    /// `Live`'s `Debug` is written rather than derived so a socket path under
-    /// somebody's home directory cannot reach a log or a bug report. Proven
-    /// against a real `ReconnectingClient` over a real socket, because the
-    /// thing being guarded against is the DERIVED impl, and a fake that did
-    /// not hold a client could not tell the two apart.
-    #[tokio::test]
-    async fn debug_says_nothing_about_the_connection() {
-        let dir = tempfile::tempdir().unwrap();
-        let socket = shep_client::testing::control_address(dir.path());
-        let (_fake, _served) = shep_client::testing::fake_daemon_accepting_repeatedly(
-            &socket,
-            Response::Flock(Vec::new()),
-        );
-        let client = ReconnectingClient::connect_as_dog(&socket, "weathervane")
-            .await
-            .unwrap();
-        let shown = format!("{:?}", Live::new(client));
-
-        assert_eq!(shown, "Live(<shepherd session>)");
-        assert!(
-            !shown.contains("weathervane"),
-            "the announced name leaked: {shown}"
-        );
-        assert!(
-            !shown.contains(&socket.display().to_string()),
-            "the socket path leaked: {shown}"
-        );
-    }
     /// What a test runs on every reopen, handed the sheep's name.
     type Hook = Box<dyn Fn(&str)>;
 

@@ -1,0 +1,50 @@
+name: commits
+# Rejects a pull request carrying a commit subject that is not a conventional
+# commit. .githooks/commit-msg checks the same thing locally, but
+# core.hooksPath is per clone, so this job is the gate.
+#
+# release-plz builds this crate's changelog from subjects, and
+# `filter_unconventional = true` in release-plz-changelog.toml drops one that
+# does not parse: no entry, no bump, silently.
+#
+# Both gates read the rule out of .githooks/subject-gate.sh. A rule written
+# twice is a rule the two can disagree about, and tests/commit_gate.rs refuses
+# this file a second copy of it.
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  conventional:
+    name: conventional subjects
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Full history: a subject is only checkable if it is fetched.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check every commit subject on this branch
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -eu
+          # --no-merges: this checks the subjects an author wrote. A merge
+          # commit's subject is the pull request title (merge_commit_title is
+          # PR_TITLE), which this job does not see, and a merge subject is
+          # git's own rather than somebody's choice.
+          #
+          # %s is git's cleaned-up subject: blank lines and comment lines
+          # already gone, the same subject the local hook is handed raw. An
+          # empty line out of it is a commit made with --allow-empty-message,
+          # and the gate refuses it rather than skipping it.
+          #
+          # fixup!/squash!/amend! markers are refused here where the local hook
+          # lets them through: unsquashed, they parse as nothing.
+          subjects=$(mktemp)
+          git log --no-merges --format='%s' "$BASE..$HEAD" > "$subjects"
+          if ! sh .githooks/subject-gate.sh < "$subjects"; then
+            echo "::error::the subjects above are not conventional. Rewrite them as: type(optional-scope): lowercase summary"
+            exit 1
+          fi
