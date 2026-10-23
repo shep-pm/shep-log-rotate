@@ -6,14 +6,36 @@
 # one that does not parse: no changelog entry, no bump, even for a breaking
 # change.
 #
+# The rule itself is in .githooks/subject-gate.sh, which
+# .github/workflows/commits.yml runs too. What is here is the part that only a
+# hook needs: reading the subject out of the message file the way git will, and
+# letting git's own subjects through.
+#
 # Install once per clone: git config core.hooksPath .githooks
 
 msg_file="$1"
-subject=$(sed -n '1p' "$msg_file")
+gate=$(dirname "$0")/subject-gate.sh
+
+# git runs this hook on the message file before it cleans the message up, so
+# line 1 of the file is not what git records. An editor left with a blank first
+# line, or a commit.template opening with comment lines, both put the subject
+# further down. Take the first line git keeps, which is what
+# `git log --format=%s` prints and what the workflow then checks: git's default
+# cleanup for an edited message is `strip`, leading and trailing empty lines
+# gone, trailing whitespace gone, comment lines gone.
+comment_char=$(git config --get core.commentChar 2>/dev/null)
+[ -n "$comment_char" ] || comment_char='#'
+subject=$(awk -v c="$comment_char" '
+  { sub(/\r$/, "") }
+  index($0, c) == 1 { next }
+  $0 ~ /^[ \t]*$/ { next }
+  { sub(/[ \t]+$/, ""); print; exit }
+' "$msg_file")
 
 # git's own merge subjects, and the autosquash markers `git rebase
-# --autosquash` consumes locally. .github/workflows/commits.yml still rejects
-# a marker that reaches a pull request unsquashed.
+# --autosquash` consumes locally. The workflow still rejects a marker that
+# reaches a pull request unsquashed, and it never sees a merge subject because
+# it lists commits with --no-merges.
 if printf '%s' "$subject" | grep -qE "^Merge (branch|branches|remote-tracking branch|remote-tracking branches|tag|tags|commit|commits) |^Merge pull request #"; then
     exit 0
 fi
@@ -21,18 +43,14 @@ case "$subject" in
     "fixup!"*|"squash!"*|"amend!"*) exit 0 ;;
 esac
 
-# revert and build are real conventional types but are refused: the changelog
-# config has no parser for either, so they would vanish like any unreadable
-# subject. Scope is `[^()]` because git-conventional allows any character in a
-# scope except a parenthesis.
-if printf '%s' "$subject" | grep -qE '^(feat|fix|perf|refactor|docs|test|ci|chore|style)(\([^()]+\))?!?: .+'; then
+if printf '%s\n' "$subject" | sh "$gate" >/dev/null 2>&1; then
     exit 0
 fi
 
 cat >&2 <<MSG
 Not a conventional commit subject:
 
-  $subject
+  ${subject:-<empty>}
 
 Write it as: type(optional-scope): lowercase summary
 

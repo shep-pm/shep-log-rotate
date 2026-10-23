@@ -6,6 +6,10 @@ name: commits
 # release-plz builds this crate's changelog from subjects, and
 # `filter_unconventional = true` in release-plz-changelog.toml drops one that
 # does not parse: no entry, no bump, silently.
+#
+# Both gates read the rule out of .githooks/subject-gate.sh. A rule written
+# twice is a rule the two can disagree about, and tests/commit_gate.rs refuses
+# this file a second copy of it.
 on:
   pull_request:
 permissions:
@@ -28,23 +32,19 @@ jobs:
           set -eu
           # --no-merges: this checks the subjects an author wrote. A merge
           # commit's subject is the pull request title (merge_commit_title is
-          # PR_TITLE), which this job does not see. Unlike the local hook,
-          # fixup!/squash!/amend! markers are refused here: unsquashed, they
-          # parse as nothing.
-          bad=0
-          while IFS= read -r subject; do
-            [ -z "$subject" ] && continue
-            if printf '%s' "$subject" | grep -qE '^(feat|fix|perf|refactor|docs|test|ci|chore|style)(\([^()]+\))?!?: .+'; then
-              printf '  ok       %s\n' "$subject"
-            else
-              printf '  REFUSED  %s\n' "$subject"
-              bad=$((bad + 1))
-            fi
-          done <<EOF
-          $(git log --no-merges --format='%s' "$BASE..$HEAD")
-          EOF
-          if [ "$bad" -gt 0 ]; then
-            echo "::error::$bad commit subject(s) above are not conventional. Rewrite them as: type(optional-scope): lowercase summary"
+          # PR_TITLE), which this job does not see, and a merge subject is
+          # git's own rather than somebody's choice.
+          #
+          # %s is git's cleaned-up subject: blank lines and comment lines
+          # already gone, the same subject the local hook is handed raw. An
+          # empty line out of it is a commit made with --allow-empty-message,
+          # and the gate refuses it rather than skipping it.
+          #
+          # fixup!/squash!/amend! markers are refused here where the local hook
+          # lets them through: unsquashed, they parse as nothing.
+          subjects=$(mktemp)
+          git log --no-merges --format='%s' "$BASE..$HEAD" > "$subjects"
+          if ! sh .githooks/subject-gate.sh < "$subjects"; then
+            echo "::error::the subjects above are not conventional. Rewrite them as: type(optional-scope): lowercase summary"
             exit 1
           fi
-          echo "All $(git log --no-merges --oneline "$BASE..$HEAD" | wc -l | tr -d ' ') commit subject(s) are conventional."
