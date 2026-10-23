@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use shep_client::{ConnectError, RequestError};
+use shep_client::{RequestError, dogs::ShepherdError};
 
 use crate::config::ConfigError;
 
@@ -30,10 +30,16 @@ use crate::config::ConfigError;
 /// Pinned by `debug_carries_the_section_and_nothing_else`.
 #[derive(Debug)]
 pub enum Error {
-    /// The shepherd's socket could not be reached.
-    Connect(ConnectError),
-    /// A request reached the shepherd and came back an error.
-    Request(RequestError),
+    /// The shepherd could not be reached, refused a request, or dropped the
+    /// link and did not come back.
+    ///
+    /// One variant rather than one per stage, because the client that fails
+    /// this dog already sorts its own failures into these three, and it is
+    /// `#[non_exhaustive]`: a way to fail added to shep-client after this dog
+    /// was written arrives here without touching this enum. Splitting it here
+    /// would mean this crate re-deciding a question shep answers better, and
+    /// `Display` is shep's own sentence for the cause either way.
+    Shepherd(ShepherdError),
     /// The shepherd answered with a response this dog cannot use.
     Protocol(String),
     /// The dog's own `[<name>]` section could not be understood.
@@ -87,8 +93,7 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Connect(err) => write!(f, "cannot reach the shepherd: {err}"),
-            Self::Request(err) => write!(f, "the shepherd refused a request: {err}"),
+            Self::Shepherd(err) => write!(f, "{err}"),
             Self::Protocol(what) => write!(f, "unexpected answer from the shepherd: {what}"),
             Self::Config { section, source } => {
                 write!(f, "bad [{section}] section: {source}")
@@ -108,8 +113,7 @@ impl fmt::Display for Error {
 impl core::error::Error for Error {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
-            Self::Connect(err) => Some(err),
-            Self::Request(err) => Some(err),
+            Self::Shepherd(err) => Some(err),
             Self::Config { source, .. } => Some(source),
             Self::Io { source, .. } => Some(source),
             Self::Protocol(_) | Self::Exhausted { .. } => None,
@@ -117,15 +121,20 @@ impl core::error::Error for Error {
     }
 }
 
-impl From<ConnectError> for Error {
-    fn from(err: ConnectError) -> Self {
-        Self::Connect(err)
+impl From<ShepherdError> for Error {
+    fn from(err: ShepherdError) -> Self {
+        Self::Shepherd(err)
     }
 }
 
+/// A failed request on a connection this dog already holds.
+///
+/// Its own impl rather than leaning on [`ShepherdError`]'s: every `?` on a
+/// client call in [`tick`](crate::tick::tick) lands here, and naming the wrapper in
+/// each of them would say nothing.
 impl From<RequestError> for Error {
     fn from(err: RequestError) -> Self {
-        Self::Request(err)
+        Self::Shepherd(err.into())
     }
 }
 
@@ -206,6 +215,18 @@ mod tests {
         assert_eq!(
             shown, "Config { section: \"weathervane\", source: Keep }",
             "the derived shape is the documented decision, so a change to it is a decision too"
+        );
+    }
+
+    #[test]
+    fn a_refused_shepherd_renders_in_sheps_own_words() {
+        // The sentence is shep-client's, not this crate's, and the point of
+        // wrapping it is that an operator reading a dog's log gets the same
+        // words they would from `shep` itself.
+        let err = Error::Shepherd(ShepherdError::from(RequestError::Closed));
+        assert_eq!(
+            err.to_string(),
+            "a request to the shepherd failed: the connection closed before a reply arrived"
         );
     }
 

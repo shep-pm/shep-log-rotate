@@ -27,7 +27,7 @@
 //! # How it learns its own name
 //!
 //! Two names, from two places, and conflating them is how this went wrong
-//! once already. See [`Identity`].
+//! once already. See [`DogIdentity`].
 //!
 //! The handshake name is what goes in the `Hello` frame, and it comes from
 //! `$SHEP_DOG_NAME` and from nowhere else. shep sets it in the environment
@@ -43,14 +43,20 @@
 //!
 //! The config name is the `[<name>]` key the settings live under in
 //! `dogs.toml`. Getting that one wrong is silent in its own way: the daemon
-//! answers `DogConfig` for a name nobody adopted with an empty section,
-//! which is byte for byte what a dog running on its defaults gets. Adopt
-//! this binary as `logrotate` when it asks for `log-rotate` and every
-//! setting in the operator's `dogs.toml` is discarded without either side
-//! saying so. It is
-//! the handshake name whenever there is one, and [`DEFAULT_NAME`] when
+//! answers a config request for a name nobody adopted with an empty section,
+//! which is byte for byte what a dog running on its defaults gets. Adopt this
+//! binary as `logrotate` when it asks for `log-rotate` and every setting in
+//! the operator's `dogs.toml` is discarded without either side saying so. It
+//! is the handshake name whenever there is one, and [`DEFAULT_NAME`] when
 //! there is not, because somebody running this binary by hand still wants
 //! their `dogs.toml` read.
+//!
+//! Both names used to be spelled here as an `Identity` of two fields with a
+//! `from_env` that read `$SHEP_DOG_NAME` by hand. [`DogIdentity`] is that same
+//! type in shep-client, with the same rule that only the section may fall
+//! back, so the two cannot drift apart any more. The tests below still pin the
+//! half that is this dog's own: which default section it asks for, and that an
+//! empty name is no name.
 
 #![forbid(unsafe_code)]
 
@@ -69,7 +75,9 @@ use core::fmt;
 use std::{path::PathBuf, process::ExitCode, time::SystemTime};
 
 use shep_client::{
-    ConnectError, LinkState, ReconnectingClient, shep_core::paths::ShepPaths,
+    ConnectError, LinkState,
+    dogs::{DogIdentity, DogRuntime, ShepherdError},
+    shep_core::paths::ShepPaths,
     shep_core::values::UpDuration,
 };
 
@@ -85,7 +93,7 @@ use crate::{
 /// hand.
 ///
 /// A config-section default only. It is never announced in the handshake:
-/// see [`Identity`] for why the two names part company here rather than
+/// see [`DogIdentity`] for why the two names part company here rather than
 /// sharing one fallback.
 ///
 /// It matches what `shep adopt shep-log-rotate` picks on its own, which the
@@ -202,57 +210,23 @@ impl Action {
     }
 }
 
-/// The two names this dog needs, and the two different places they come
-/// from.
-///
-/// Separate fields rather than one string, because they answer different
-/// questions and only one of them may be guessed at. The module docs have
-/// the argument; this type is what stops the code drifting back to one
-/// name for both.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Identity {
-    /// What to announce in the `Hello` frame, or `None` for a process no
-    /// shepherd spawned.
-    ///
-    /// Never falls back to [`DEFAULT_NAME`]. A name the daemon did not hand
-    /// out is a name it will act on anyway: a refused handshake is recorded
-    /// against whatever the frame said, so an invented one asks the daemon
-    /// to restart a dog that is running perfectly well.
-    handshake: Option<String>,
-    /// The `[<name>]` section to read out of `dogs.toml`.
-    section: String,
-}
-
-impl Identity {
-    /// Read both names out of the environment.
-    ///
-    /// Takes a lookup rather than reading [`std::env::var`] itself. The
-    /// environment is a process-wide mutable global, and a test that sets
-    /// one variable to check the absent case is a test that races every
-    /// other test in the binary.
-    ///
-    /// An empty `$SHEP_DOG_NAME` reads as unset. It cannot be a real dog:
-    /// `[]` is not a section anybody can write, and an empty name in a
-    /// `Hello` frame is a handshake the daemon cannot attribute either.
-    fn from_env(env: impl Fn(&str) -> Option<String>) -> Self {
-        let handshake = env("SHEP_DOG_NAME").filter(|name| !name.is_empty());
-        let section = handshake.clone().unwrap_or_else(|| DEFAULT_NAME.to_owned());
-        Self { handshake, section }
-    }
-}
-
-/// Connect, announcing the handshake name when there is one.
+/// Connect, and read the section, the way [`DogRuntime`] starts every dog.
 ///
 /// The name is settled once, before the loop starts, rather than looked up
-/// per connection: it comes out of the environment shep spawned this
-/// process with, and a shepherd that restarted underneath the dog did not
-/// reach into that environment and rewrite it.
-async fn connect(socket: &std::path::Path, identity: &Identity) -> Result<Live, Error> {
-    let client = match &identity.handshake {
-        Some(name) => ReconnectingClient::connect_as_dog(socket, name).await?,
-        None => ReconnectingClient::connect(socket).await?,
-    };
-    Ok(Live::new(client))
+/// per connection: it comes out of the environment shep spawned this process
+/// with, and a shepherd that restarted underneath the dog did not reach into
+/// that environment and rewrite it.
+///
+/// `DogRuntime` reads this dog's section on the way in, and a tick does not
+/// run on that copy: [`tick`](crate::tick::tick) asks for the section again on
+/// every pass so a change in `dogs.toml` takes effect on the next tick. What
+/// the startup is for is the connection: it opens as this dog's identity, and
+/// the client inside the runtime re-establishes it on its own backoff from then
+/// on.
+async fn connect(paths: &ShepPaths, identity: &DogIdentity) -> Result<Live, Error> {
+    Ok(Live::new(
+        DogRuntime::start(identity.clone(), paths.clone()).await?,
+    ))
 }
 
 /// Say why this dog is stopping, and hand back the code to stop with.
@@ -292,7 +266,7 @@ fn refused(daemon_version: Option<&str>, message: &str) -> ExitCode {
 ///
 /// The cost is self-healing: the fix now needs a `shep restart` as well.
 /// The one this names uses the section, which is the adopted name
-/// whenever a shepherd spawned the process. See [`Identity`].
+/// whenever a shepherd spawned the process. See [`DogIdentity`].
 fn unusable_config(section: &str, source: &ConfigError) -> String {
     format!(
         "shep-log-rotate: the [{section}] section in dogs.toml is not one this dog can use: \
@@ -322,9 +296,11 @@ fn unusable_config(section: &str, source: &ConfigError) -> String {
 /// queueing, so a tick landing in that gap is precisely the failed tick
 /// this loop already retries. Dropping the session would abort a supervisor
 /// mid-backoff and replace it with an unsupervised first connection, which
-/// is strictly worse. The `Option` survives for the case it was always
-/// really about: the first connection, which nothing supervises and which
-/// fails whenever this dog is started before the socket exists.
+/// is strictly worse: dropping a [`DogRuntime`] drops the client inside it,
+/// and with it the task that was reconnecting. The `Option` survives for the
+/// case it was always really about: the first connection, which nothing
+/// supervises and which fails whenever this dog is started before the socket
+/// exists.
 ///
 /// The only signals handled are the two that mean stop: ctrl-c, the
 /// clean-exit path for an operator running this in a terminal, and on unix
@@ -339,7 +315,7 @@ fn unusable_config(section: &str, source: &ConfigError) -> String {
 /// `kill_timeout` still decides that. Rotation on `SIGHUP` is a shape people
 /// expect from `logrotate`, and adding it here would be arguing with the
 /// supervisor about who decides when this process does work.
-async fn poll(socket: &std::path::Path, identity: &Identity) -> ExitCode {
+async fn poll(paths: &ShepPaths, identity: &DogIdentity) -> ExitCode {
     let mut stop = Stop::on_stop_signals();
     // The interval to wait when there is no session to read one from. A
     // disconnected dog has no configuration either, so the default is the
@@ -347,7 +323,7 @@ async fn poll(socket: &std::path::Path, identity: &Identity) -> ExitCode {
     let default_interval = Config::default().interval;
     let mut session: Option<Live> = None;
 
-    if identity.handshake.is_none() {
+    if identity.handshake().is_none() {
         // Once, before the loop, rather than per connection: the answer
         // cannot change while this process runs, and a dog whose socket is
         // not up yet would otherwise print it on every retry.
@@ -366,13 +342,13 @@ async fn poll(socket: &std::path::Path, identity: &Identity) -> ExitCode {
 
     loop {
         if session.is_none() {
-            match connect(socket, identity).await {
+            match connect(paths, identity).await {
                 Ok(live) => session = Some(live),
-                Err(Error::Connect(ConnectError::ProtocolMismatch {
+                Err(Error::Shepherd(ShepherdError::Connect(ConnectError::ProtocolMismatch {
                     daemon_version,
                     message,
                     ..
-                })) => return refused(daemon_version.as_deref(), &message),
+                }))) => return refused(daemon_version.as_deref(), &message),
                 Err(err) => eprintln!("shep-log-rotate: {err}"),
             }
         }
@@ -389,7 +365,7 @@ async fn poll(socket: &std::path::Path, identity: &Identity) -> ExitCode {
             {
                 return refused(daemon_version.as_deref(), &message);
             }
-            match tick(live, &identity.section, SystemTime::now(), &mut stop).await {
+            match tick(live, identity.section(), SystemTime::now(), &mut stop).await {
                 Ok((config, report)) => {
                     interval = config.interval;
                     // Silence on a quiet tick is the point, not tidiness:
@@ -481,7 +457,7 @@ fn main() -> ExitCode {
         }
     };
     let paths = ShepPaths::resolve(&env, &home_dir);
-    let identity = Identity::from_env(env);
+    let identity = DogIdentity::from_env(&env, DEFAULT_NAME);
 
     // Built by hand rather than through `#[tokio::main]` for the line after
     // the poll. Dropping a runtime waits for every blocking task it started,
@@ -499,7 +475,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let code = runtime.block_on(poll(&paths.socket, &identity));
+    let code = runtime.block_on(poll(&paths, &identity));
     runtime.shutdown_background();
     code
 }
@@ -522,13 +498,23 @@ mod tests {
     use super::*;
     use crate::test_support::assert_no_dashes;
     use core::time::Duration;
-    use shep_client::shep_core::protocol::Response;
+    use shep_client::shep_core::dogs::DOG_NAME_VAR;
+    use shep_client::testing::{
+        Handshake, control_address, fake_daemon_across_handovers, sample_ack,
+    };
 
     /// An environment holding exactly one variable, which is the only one
-    /// [`Identity::from_env`] reads.
+    /// [`DogIdentity::from_env`] reads.
     fn only(key: &str, value: &str) -> impl Fn(&str) -> Option<String> {
         let (key, value) = (key.to_owned(), value.to_owned());
         move |asked| (asked == key).then(|| value.clone())
+    }
+
+    /// Both names this dog needs, read out of an environment holding `name`
+    /// as `$SHEP_DOG_NAME`.
+    fn identity_with(name: &str) -> DogIdentity {
+        let env = only(DOG_NAME_VAR, name);
+        DogIdentity::from_env(&env, DEFAULT_NAME)
     }
 
     #[test]
@@ -600,10 +586,11 @@ mod tests {
     fn the_dog_takes_both_names_from_shep_dog_name() {
         // Not the default name, because the default name is exactly what a
         // broken lookup falls back to.
-        let identity = Identity::from_env(only("SHEP_DOG_NAME", "weathervane"));
-        assert_eq!(identity.handshake.as_deref(), Some("weathervane"));
+        let identity = identity_with("weathervane");
+        assert_eq!(identity.handshake(), Some("weathervane"));
         assert_eq!(
-            identity.section, "weathervane",
+            identity.section(),
+            "weathervane",
             "the section follows the adopted name, so [weathervane] is what gets read"
         );
     }
@@ -613,19 +600,20 @@ mod tests {
         // The half that matters. A dog nothing adopted must send no name at
         // all: a guessed one is recorded against a real dog, and the daemon
         // restarts that one when this connection is refused.
-        let identity = Identity::from_env(|_| None);
-        assert_eq!(identity.handshake, None);
+        let identity = DogIdentity::from_env(&|_| None, DEFAULT_NAME);
+        assert_eq!(identity.handshake(), None);
         assert_eq!(
-            identity.section, DEFAULT_NAME,
+            identity.section(),
+            DEFAULT_NAME,
             "a hand run still reads a section, and this is the one the README documents"
         );
     }
 
     #[test]
     fn an_empty_shep_dog_name_is_no_name() {
-        let identity = Identity::from_env(only("SHEP_DOG_NAME", ""));
-        assert_eq!(identity.handshake, None);
-        assert_eq!(identity.section, DEFAULT_NAME);
+        let identity = identity_with("");
+        assert_eq!(identity.handshake(), None);
+        assert_eq!(identity.section(), DEFAULT_NAME);
     }
 
     #[test]
@@ -633,9 +621,10 @@ mod tests {
         // $SHEP_NAME and $SHEP_INSTANCE are set alongside $SHEP_DOG_NAME and
         // name the shepherd, not the dog. Reading either would put the
         // shepherd's own name in the handshake.
-        let identity = Identity::from_env(only("SHEP_NAME", "production"));
-        assert_eq!(identity.handshake, None);
-        assert_eq!(identity.section, DEFAULT_NAME);
+        let env = only("SHEP_NAME", "production");
+        let identity = DogIdentity::from_env(&env, DEFAULT_NAME);
+        assert_eq!(identity.handshake(), None);
+        assert_eq!(identity.section(), DEFAULT_NAME);
     }
 
     #[test]
@@ -665,6 +654,16 @@ mod tests {
         assert_no_dashes(&line);
     }
 
+    /// A layout rooted at `dir`, with its socket where a fake bound `socket`.
+    ///
+    /// `poll` takes the whole layout because `DogRuntime::start` does, and the
+    /// fake binds wherever the test asked, so the two are joined by hand.
+    fn paths_with_socket(dir: &std::path::Path, socket: &std::path::Path) -> ShepPaths {
+        let mut paths = ShepPaths::resolve(&|_| None, dir);
+        paths.socket = socket.to_path_buf();
+        paths
+    }
+
     /// Through `poll` over a real socket, because which arm of the loop an
     /// `Error::Config` takes is the whole behaviour. Reading the message
     /// cannot tell the arms apart: both print the same fault.
@@ -675,24 +674,26 @@ mod tests {
     #[tokio::test]
     async fn a_section_this_dog_cannot_parse_ends_the_poll_loop() {
         let dir = tempfile::tempdir().expect("a temporary directory");
-        let socket = shep_client::testing::control_address(dir.path());
-        let (_fake, _served) = shep_client::testing::fake_daemon_accepting_repeatedly(
-            &socket,
-            Response::DogSection {
-                toml: "max_age = \"1d\"\n".to_owned().into(),
-            },
-        );
-        let identity = Identity {
-            handshake: Some("weathervane".to_owned()),
-            section: "weathervane".to_owned(),
-        };
+        let socket = control_address(dir.path());
+        // A fake that answers every request on one connection. `DogRuntime::start`
+        // asks for the section on the way in and the tick asks again, and a fake
+        // that answers one request per connection drops the connection under the
+        // second ask: the loop would then be tested against a closed connection
+        // rather than against the section it cannot use.
+        let handovers =
+            fake_daemon_across_handovers(&socket, vec![Handshake::Accept(sample_ack())]);
+        handovers.reply_to_dog_config("max_age = \"1d\"\n");
+        let identity = DogIdentity::named("weathervane");
 
-        let code = tokio::time::timeout(Duration::from_secs(10), poll(&socket, &identity))
-            .await
-            .expect(
-                "a section this dog cannot use must end the loop; retrying it is an \
+        let code = tokio::time::timeout(
+            Duration::from_secs(10),
+            poll(&paths_with_socket(dir.path(), &socket), &identity),
+        )
+        .await
+        .expect(
+            "a section this dog cannot use must end the loop; retrying it is an \
                  infinite run of identical failures in the log this dog keeps small",
-            );
+        );
         assert_eq!(
             format!("{code:?}"),
             format!("{:?}", ExitCode::FAILURE),
@@ -710,15 +711,15 @@ mod tests {
         // Bound by nobody: every connect fails, which is what a dog started
         // before its shepherd sees.
         let socket = shep_client::testing::control_address(dir.path());
-        let identity = Identity {
-            handshake: Some("weathervane".to_owned()),
-            section: "weathervane".to_owned(),
-        };
+        let identity = DogIdentity::named("weathervane");
 
         assert!(
-            tokio::time::timeout(Duration::from_secs(2), poll(&socket, &identity))
-                .await
-                .is_err(),
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                poll(&paths_with_socket(dir.path(), &socket), &identity),
+            )
+            .await
+            .is_err(),
             "a dog whose socket is not up yet must keep waiting for it"
         );
     }

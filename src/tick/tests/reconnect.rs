@@ -15,21 +15,10 @@
 //! A child of `tick::tests` so it shares that module's `sheep` builder, and in
 //! its own file so `tick.rs` stays under its file-size baseline.
 
-use super::*;
+use super::{live::session, *};
 use shep_client::testing::{
     Handovers, Handshake, control_address, fake_daemon_across_handovers, sample_ack,
 };
-
-/// A [`Live`] connected to `socket` as `name`, which is the one place this
-/// file touches how a session is opened. Everything below it is asked through
-/// [`Daemon`], so it reads the same whichever client is underneath.
-async fn live_over(socket: &Path, name: &str) -> Live {
-    Live::new(
-        ReconnectingClient::connect_as_dog(socket, name)
-            .await
-            .expect("connected to the fake shepherd"),
-    )
-}
 
 /// Wait until `handovers` has accepted `wanted` connections, which is the
 /// fake's own account of the client having dialled again.
@@ -85,7 +74,7 @@ async fn a_shepherd_replaced_underneath_the_dog_is_rotated_for_again() {
     fs::write(&out, "x".repeat(2048)).expect("seeded");
     handovers.reply_to_list(vec![sheep("web", Some(&out), None)]);
 
-    let live = live_over(&socket, "weathervane").await;
+    let live = session(logs, &socket, "weathervane").await;
     let mut stop = Stop::never();
 
     let (_config, first) = tick(&live, "weathervane", SystemTime::now(), &mut stop)
