@@ -1,0 +1,50 @@
+#!/bin/sh
+# Rejects a commit subject that is not a conventional commit.
+#
+# release-plz builds the changelog and the version bump from subjects, and
+# `filter_unconventional = true` (release-plz-changelog.toml) silently drops
+# one that does not parse: no changelog entry, no bump, even for a breaking
+# change.
+#
+# Install once per clone: git config core.hooksPath .githooks
+
+msg_file="$1"
+subject=$(sed -n '1p' "$msg_file")
+
+# git's own merge subjects, and the autosquash markers `git rebase
+# --autosquash` consumes locally. .github/workflows/commits.yml still rejects
+# a marker that reaches a pull request unsquashed.
+if printf '%s' "$subject" | grep -qE "^Merge (branch|branches|remote-tracking branch|remote-tracking branches|tag|tags|commit|commits) |^Merge pull request #"; then
+    exit 0
+fi
+case "$subject" in
+    "fixup!"*|"squash!"*|"amend!"*) exit 0 ;;
+esac
+
+# revert and build are real conventional types but are refused: the changelog
+# config has no parser for either, so they would vanish like any unreadable
+# subject. Scope is `[^()]` because git-conventional allows any character in a
+# scope except a parenthesis.
+if printf '%s' "$subject" | grep -qE '^(feat|fix|perf|refactor|docs|test|ci|chore|style)(\([^()]+\))?!?: .+'; then
+    exit 0
+fi
+
+cat >&2 <<MSG
+Not a conventional commit subject:
+
+  $subject
+
+Write it as: type(optional-scope): lowercase summary
+
+  feat: a new surface        fix: a bug            perf: faster
+  refactor: no behaviour change
+  docs / style / test / ci / chore: no changelog entry, which is fine
+
+Put ! after the type or scope on the commit that actually breaks something:
+
+  feat(config)!: rename interval to poll_interval
+
+To bypass once, for a commit nobody needs in a changelog:
+  git commit --no-verify
+MSG
+exit 1

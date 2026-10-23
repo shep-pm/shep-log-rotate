@@ -1,0 +1,50 @@
+name: commits
+# Rejects a pull request carrying a commit subject that is not a conventional
+# commit. .githooks/commit-msg checks the same thing locally, but
+# core.hooksPath is per clone, so this job is the gate.
+#
+# release-plz builds this crate's changelog from subjects, and
+# `filter_unconventional = true` in release-plz-changelog.toml drops one that
+# does not parse: no entry, no bump, silently.
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  conventional:
+    name: conventional subjects
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Full history: a subject is only checkable if it is fetched.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check every commit subject on this branch
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -eu
+          # --no-merges: this checks the subjects an author wrote. A merge
+          # commit's subject is the pull request title (merge_commit_title is
+          # PR_TITLE), which this job does not see. Unlike the local hook,
+          # fixup!/squash!/amend! markers are refused here: unsquashed, they
+          # parse as nothing.
+          bad=0
+          while IFS= read -r subject; do
+            [ -z "$subject" ] && continue
+            if printf '%s' "$subject" | grep -qE '^(feat|fix|perf|refactor|docs|test|ci|chore|style)(\([^()]+\))?!?: .+'; then
+              printf '  ok       %s\n' "$subject"
+            else
+              printf '  REFUSED  %s\n' "$subject"
+              bad=$((bad + 1))
+            fi
+          done <<EOF
+          $(git log --no-merges --format='%s' "$BASE..$HEAD")
+          EOF
+          if [ "$bad" -gt 0 ]; then
+            echo "::error::$bad commit subject(s) above are not conventional. Rewrite them as: type(optional-scope): lowercase summary"
+            exit 1
+          fi
+          echo "All $(git log --no-merges --oneline "$BASE..$HEAD" | wc -l | tr -d ' ') commit subject(s) are conventional."
