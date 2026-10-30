@@ -482,7 +482,15 @@ fn the_dog_reads_the_section_of_the_name_it_was_adopted_under() {
          naming = \"numeric\"\n",
     );
 
-    shepherd.ok(&["adopt", DOG_BIN, "--name", "weathervane", "--style", "bare"]);
+    shepherd.ok(&[
+        "adopt",
+        DOG_BIN,
+        "--name",
+        "weathervane",
+        "--yes",
+        "--style",
+        "bare",
+    ]);
     shepherd.ok(&[
         "start",
         script.to_str().expect("script path"),
@@ -605,7 +613,15 @@ fn adopt_puts_a_dog_in_the_listing_and_rehome_takes_it_out() {
         "nothing is adopted yet"
     );
 
-    shepherd.ok(&["adopt", DOG_BIN, "--name", "weathervane", "--style", "bare"]);
+    shepherd.ok(&[
+        "adopt",
+        DOG_BIN,
+        "--name",
+        "weathervane",
+        "--yes",
+        "--style",
+        "bare",
+    ]);
     wait_until("the adopted dog to appear in the listing", || {
         shepherd
             .ok(&["dogs", "--format", "json"])
