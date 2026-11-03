@@ -20,6 +20,14 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      dry-run-tag:
+        description: >-
+          An existing tag of this crate, e.g. v0.2.4. When set, also runs shep's
+          dog release workflow as a dry run against it: it builds every target
+          and prints the hashes, and uploads and opens nothing.
+        type: string
+        default: ""
 
 concurrency:
   group: release-plz-release
@@ -33,6 +41,12 @@ jobs:
     # wants a human gate between merging and spending a version number.
     # Inert until one is configured.
     environment: crates-io
+    outputs:
+      # release-plz reports what it released. `releases_created` is the string
+      # `true` only when it tagged something, and `releases` is a JSON array of
+      # `{package_name, tag, version, ...}`, one entry per released package.
+      releases_created: ${{ steps.release.outputs.releases_created }}
+      releases: ${{ steps.release.outputs.releases }}
     steps:
       # Every action in these two files is pinned by commit, unlike test.yml's,
       # which use moving tags. These jobs hold RELEASE_PLZ_TOKEN and
@@ -63,9 +77,69 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       # Same commit pin as release-plz-pr.yml, for the same reason.
-      - uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
+      - id: release
+        uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
         with:
           command: release
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # Builds the bare binaries `shep install` downloads, attaches them to the
+  # release release-plz just created, and opens the pull request on shep-pm/shep
+  # that approves this version and their hashes in the dog index. A person
+  # merging that pull request is the review; nothing here approves a version.
+  #
+  # Called from here rather than from a `release: published` trigger like
+  # docs-dispatch.yml, so it does not depend on which token created the
+  # release: a release made with GITHUB_TOKEN fires no such event. It runs only
+  # when release-plz released something, read from its outputs, because this
+  # workflow runs on every push to main and almost all of them release nothing.
+  #
+  # The release exists by the time this runs, which the reusable workflow
+  # checks before it builds, and the tag is `v<version>`, which `shep install`
+  # builds its download URL from.
+  #
+  # Pinned by commit, like every action here, and for the reason shep's docs
+  # give: the workflow runs with this job's `contents: write` and the index
+  # token, so a ref that can move lets a later change to it run with both. Move
+  # the sha when you choose to. This one is the merge of shep-pm/shep#1463.
+  #
+  # SHEP_INDEX_TOKEN is a PAT or GitHub App token that can push a branch and
+  # open a pull request on shep-pm/shep. It has to be a secret of this
+  # repository. GITHUB_TOKEN cannot write to another repository.
+  dog-release:
+    name: Build and index the binaries
+    needs: release-plz-release
+    if: needs.release-plz-release.outputs.releases_created == 'true'
+    permissions:
+      contents: write
+      actions: read
+    uses: shep-pm/shep/.github/workflows/dog-release.yml@3e217f93ea0e7557b10bb3cdf45cd0755365cbb9
+    with:
+      package: shep-log-rotate
+      # One crate, so one entry.
+      tag: ${{ fromJSON(needs.release-plz-release.outputs.releases)[0].tag }}
+    secrets:
+      index-token: ${{ secrets.SHEP_INDEX_TOKEN }}
+
+  # The dry run for the job above: by hand with a tag, it builds an existing
+  # release's binaries for every target and prints the hashes, so the path can
+  # be checked without spending a version number or opening a pull request on
+  # shep-pm/shep. `dog-release` cannot serve for this, since it runs only when
+  # release-plz released something and a dispatch on a released tag releases
+  # nothing. No `needs`: the dry run has no use for the release job's outcome.
+  # No secret, since a dry run opens no pull request. The permissions match the
+  # job above because a caller has to grant what the reusable workflow's
+  # `upload` job asks for, even when a dry run skips that job.
+  dog-release-dry-run:
+    name: Dry-run the binaries
+    if: github.event_name == 'workflow_dispatch' && inputs.dry-run-tag != ''
+    permissions:
+      contents: write
+      actions: read
+    uses: shep-pm/shep/.github/workflows/dog-release.yml@3e217f93ea0e7557b10bb3cdf45cd0755365cbb9
+    with:
+      package: shep-log-rotate
+      tag: ${{ inputs.dry-run-tag }}
+      dry-run: true
