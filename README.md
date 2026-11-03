@@ -125,6 +125,42 @@ prints: one row per setting, with the two grammars above resolved, so a
 bare `interval = "10"` reads as ten milliseconds rather than as ten of
 something you have to guess at. Writing needs `--allow-control`.
 
+## Setting a rule for one sheep
+
+`[log-rotate]` is the value for every sheep. A sheep that needs something
+else gets a table of its own, `[app.dogs.log-rotate]` in its config, and
+every key it sets there wins over the section for that sheep alone. Keys it
+leaves out come from `[log-rotate]`, so a table that sets only `keep` rotates
+on the section's `max_size`, `naming` and `compress`.
+
+```sh
+# the chatty one rotates early and keeps more
+shep set api.dogs.log-rotate.max_size 50M
+shep set api.dogs.log-rotate.keep 10
+
+# a rule for every sheep, in the dog's own section of dogs.toml
+shep set log-rotate.keep 3
+```
+
+If you adopted the dog under another name, that name replaces `log-rotate`
+in both addresses.
+
+- `max_size`, `max_age`, `keep`, `naming` and `compress` can be set per sheep.
+- `interval` cannot: there is one loop, so it is set in `[log-rotate]` only.
+  A sheep whose table sets it is left alone, as below.
+- A sheep with no table rotates on `[log-rotate]`. There is no switch to turn
+  rotation off for one sheep; a `max_size` larger than the log will ever grow
+  does that.
+- Both are re-read on every pass, like the section.
+- A sheep's table that the dog cannot use leaves that sheep alone for the
+  pass: its logs are neither rotated nor pruned, and the pass's one summary
+  line says which sheep and which key. The other sheep rotate as usual. A log
+  that sheep shares with another sheep is left alone for both, since a sheep
+  that is not reopened would go on writing into the renamed file.
+- A rotated generation is pruned by the rules of the sheep that rotated it.
+  Two sheep sharing one log path share its verdict: the first sheep in the
+  flock's order decides whether it has grown enough.
+
 ## The two naming schemes
 
 `dated` names each generation after the moment it was rotated:
@@ -251,7 +287,7 @@ that name in the output.
 
 ## A note on the dependency
 
-`Cargo.toml` reads `shep-client = "0.23.0"`, by version alone, from crates.io.
+`Cargo.toml` reads `shep-client = "0.24.0"`, by version alone, from crates.io.
 It carried a git URL alongside until shep published on 2026-08-26, which was the
 only thing blocking this crate from being published itself.
 
@@ -263,7 +299,7 @@ the older release each piece arrived in and why each still holds: the
 request from 0.13.0, the permission manifest from 0.17.0, and `ReconnectingClient`'s dog-named handshake from 0.1.23,
 which is still what keeps this dog from being rendered `silent` after a handover.
 
-The floor and the lockfile answer different questions. `^0.23.0` is the oldest
+The floor and the lockfile answer different questions. `^0.24.0` is the oldest
 client this code compiles against. `Cargo.lock` pins whichever release was
 newest when it was last refreshed, and that is what a reproducible build of
 this crate ships: `cargo install` honours a packaged lockfile under `--locked`,
