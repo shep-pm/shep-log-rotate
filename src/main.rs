@@ -76,7 +76,8 @@ use std::{path::PathBuf, process::ExitCode, time::SystemTime};
 
 use shep_client::{
     ConnectError, LinkState,
-    dogs::{DogIdentity, DogRuntime, ShepherdError},
+    dogs::{DogIdentity, DogRuntime, Probe, ShepherdError},
+    shep_core::dogs::manifest::Permission,
     shep_core::paths::ShepPaths,
     shep_core::values::UpDuration,
 };
@@ -425,7 +426,22 @@ fn main() -> ExitCode {
     // `env!` here rather than inside `probe`: it expands where it is
     // written, so a call that spelled it in shep-client would report
     // shep-client's version as this dog's.
-    shep_client::dogs::probe::<config::Section>(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+    //
+    // The permissions are the two requests a tick makes that a dog may not
+    // always make: the flock listing and the reopen. Its own section is a
+    // read every dog is allowed.
+    Probe::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+        .permission(Permission::new(
+            "flock.read",
+            true,
+            "lists the flock to find each sheep's log files",
+        ))
+        .permission(Permission::new(
+            "logs.manage",
+            true,
+            "asks the shepherd to reopen a log after renaming it",
+        ))
+        .answer::<config::Section>();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let action = match Action::parse(args.iter().map(String::as_str)) {
@@ -629,10 +645,11 @@ mod tests {
 
     #[test]
     fn the_config_refusal_names_the_section_the_fault_and_the_file_to_edit() {
-        // The value that started this. shep's duration grammar has no day
-        // unit at all, so a week is "168h" and "1d" is refused, and a
-        // maintainer set it from lookout without either side saying so.
-        let source = Config::from_toml("max_age = \"1d\"\n")
+        // The shape of the value that started this. shep's duration grammar
+        // has no week unit, so "1w" is refused, and a maintainer set it from
+        // lookout without either side saying so. It was "1d" until shep
+        // learned the day unit, so the test needs a unit the grammar lacks.
+        let source = Config::from_toml("max_age = \"1w\"\n")
             .expect_err("shep's duration grammar has no day unit");
         let line = unusable_config("weathervane", &source);
 
@@ -645,7 +662,7 @@ mod tests {
             line.contains("dogs.toml"),
             "an operator reading this has to be told which file to open: {line}"
         );
-        assert!(line.contains("max_age") && line.contains("1d"), "{line}");
+        assert!(line.contains("max_age") && line.contains("1w"), "{line}");
         assert!(
             line.contains("shep restart weathervane"),
             "exiting costs the self-healing the retry arm had, so the line that spends it \
@@ -682,7 +699,7 @@ mod tests {
         // rather than against the section it cannot use.
         let handovers =
             fake_daemon_across_handovers(&socket, vec![Handshake::Accept(sample_ack())]);
-        handovers.reply_to_dog_config("max_age = \"1d\"\n");
+        handovers.reply_to_dog_config("max_age = \"1w\"\n");
         let identity = DogIdentity::named("weathervane");
 
         let code = tokio::time::timeout(

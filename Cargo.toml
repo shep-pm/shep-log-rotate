@@ -32,7 +32,7 @@ integration = []
 # Published 2026-08-26, so the git and branch keys are gone and this resolves
 # from the registry. The lockfile is what proves which source was used.
 #
-# The floor is 0.16.1, the shep this dog is built and tested against. It is
+# The floor is 0.23.0, the shep this dog is built against. It is
 # a raised floor rather than the oldest version that still compiles, and that
 # is a change in what a floor here is for.
 #
@@ -47,16 +47,27 @@ integration = []
 # Protocol is still what a version skew breaks first, and it is not what
 # binds here. A dog announces the `PROTOCOL_VERSION` of the shep-core it was
 # compiled against, and the shepherd refuses a handshake below its own
-# `MIN_SUPPORTED`. 0.16.1 announces 11 and accepts 8, so this dog is still
+# `MIN_SUPPORTED`. 0.23.0 announces 15 and accepts 8, so this dog is still
 # heard by a much older shepherd; what it asks for is not. Its section now
 # goes through `Request::DogConfigResolved`, and a shepherd too old to know
 # that request is answered by the client's own fallback to the plain one, so
 # an old daemon still serves this dog, just without resolving a secret
 # reference in its section.
 #
+# A shepherd that speaks 12 or newer also enforces a dog's grants, and a dog
+# is granted only what its manifest asked for. This dog asks for `flock.read`
+# and `logs.manage` through `dogs::Probe`, and nothing else: its own section
+# is a read every dog may make. Without the ask a current shepherd answers
+# every listing and every reopen with Forbidden.
+#
 # The older floors, kept because each is still load-bearing and none is
 # visible in a version number:
 #
+# - 0.17.0 first had `dogs::Probe` answer `--shep-manifest`, which is where
+#   a dog declares the permissions above, and first mapped every request to a
+#   permission on the shepherd's side.
+# - 0.20.0 is the shep-core where `UpDuration` first parsed a trailing `d`
+#   as a day, so `max_age = "7d"` is a spelling this dog's section accepts.
 # - 0.13.0 first had `Client::dog_config` ask `Request::DogConfigResolved`,
 #   which is what lets a `[<name>]` section hold a `{{secret:...}}` reference
 #   and reach this dog expanded. Below it the same call asks the plain
@@ -90,7 +101,7 @@ integration = []
 #   `UpDuration`. Before it, a dog borrowing shep's grammars for its config
 #   type needed a second, direct shep-core dependency to turn that feature
 #   on. After it, `shep_client::shep_core` is the only path to these types.
-shep-client = "0.16.1"
+shep-client = "0.23.0"
 # `#[derive(JsonSchema)]` expands to absolute `schemars::` paths, so the
 # crate has to be nameable here even though shep-client already carries it.
 # Same version floor shep itself pins, so this adds an edge and not a crate.
@@ -109,7 +120,7 @@ tempfile = "3"
 # replaced. The feature gates shep-client's own `testing` module, which binds a
 # fake shepherd this crate can connect to. Nothing in the shipped binary sees
 # it.
-shep-client = { version = "0.16.1", features = ["test-support"] }
+shep-client = { version = "0.23.0", features = ["test-support"] }
 # The schema tests read the JSON `config_schema` builds, so they need the
 # type it is made of. Nothing in the shipped binary names serde_json.
 serde_json = "1"

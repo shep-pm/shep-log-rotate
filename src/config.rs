@@ -345,7 +345,8 @@ pub const PRINT_CONFIG: &str = r#"[log-rotate]
 # Optionally also rotate this long after the last rotation, whatever the
 # size. A log never rotated counts from when it appeared, or from its last
 # write where the filesystem keeps no birth time. Unset means size only.
-# shep's UpDuration has no day unit: spell a week as hours, not "7d".
+# shep's UpDuration takes ms, s, m, h and d, and has no week unit: a week
+# is "7d" or "168h", not "1w".
 #max_age = "168h"
 # Generations to keep. Older ones are deleted. Must be at least 1.
 #keep = 5
@@ -391,9 +392,8 @@ interval = "5s"
         )
         .expect("valid");
         assert_eq!(config.max_size.bytes(), 1024 * 1024);
-        // 168h, not "7d": UpDuration's grammar is `^\d+(h|m|s)?$`, with no
-        // day unit, so "7d" is a spelling shep itself refuses. 168h is the
-        // same span written the way shep actually accepts it.
+        // 168h and "7d" are the same span, and UpDuration's grammar is
+        // `^\d+(ms|d|h|m|s)?$`, so both are spellings shep accepts.
         assert_eq!(
             config.max_age.expect("set").as_duration().as_secs(),
             7 * 86_400
