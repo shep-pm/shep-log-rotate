@@ -49,11 +49,11 @@ use std::{
 };
 
 use shep_client::{
-    LinkState,
+    LinkState, RequestError,
     dogs::DogRuntime,
     shep_core::{
         config::DogTable,
-        protocol::{ProcessInfo, Request, Response, SelectorSpec},
+        protocol::{ProcessInfo, Request, Response, RpcErrorCode, SelectorSpec},
     },
 };
 
@@ -871,10 +871,7 @@ impl Daemon for Live {
         let asked = Request::DogSheepSettings {
             dog: name.to_owned(),
         };
-        match self.0.client().request(asked).await? {
-            Response::DogSheepSettings { tables } => Ok(tables),
-            other => Err(unexpected("DogSheepSettings", &other)),
-        }
+        tables_from(self.0.client().request(asked).await)
     }
 
     async fn list_flock(&self) -> Result<Vec<ProcessInfo>, Error> {
@@ -892,6 +889,35 @@ impl Daemon for Live {
             Response::Reopened(_) => Ok(()),
             other => Err(unexpected("Reopen", &other)),
         }
+    }
+}
+
+/// The sheep tables an answer to `DogSheepSettings` stands for.
+///
+/// A shepherd that does not know the request refuses it with `Unsupported`,
+/// or with `Unrecognized` when the refusal's own code is one this build was
+/// not taught. Such a shepherd has no `[app.dogs.<name>]` table to serve, so
+/// no sheep has a rule of its own and every one rotates on the section, which
+/// is what no tables at all means. Failing the tick instead would leave this
+/// dog unable to rotate anything on a shepherd that runs perfectly well,
+/// the same reason the client's own `dog_config` falls back for a section.
+/// Any other refusal still stops the tick: a `Forbidden` or a dropped link is
+/// a fault the operator has to hear about, not a missing feature.
+fn tables_from(
+    answer: Result<Response, RequestError>,
+) -> Result<BTreeMap<String, DogTable>, Error> {
+    match answer {
+        Ok(Response::DogSheepSettings { tables }) => Ok(tables),
+        Ok(other) => Err(unexpected("DogSheepSettings", &other)),
+        Err(RequestError::Rpc(refusal))
+            if matches!(
+                refusal.code,
+                RpcErrorCode::Unsupported | RpcErrorCode::Unrecognized
+            ) =>
+        {
+            Ok(BTreeMap::new())
+        }
+        Err(err) => Err(err.into()),
     }
 }
 

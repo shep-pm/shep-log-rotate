@@ -208,3 +208,52 @@ async fn each_tick_asks_the_shepherd_for_the_sheeps_tables_and_applies_them() {
     }
     assert!(!out.exists(), "web's own 1K applied to its 2K log");
 }
+
+/// A refusal the shepherd gives, as the client hands it over.
+fn refused(code: RpcErrorCode) -> Result<Response, RequestError> {
+    Err(RequestError::Rpc(RpcError {
+        code,
+        message: "refused".to_owned(),
+        daemon_version: None,
+    }))
+}
+
+#[test]
+fn a_shepherd_that_predates_the_sheep_tables_means_no_tables() {
+    // `Unsupported` is what a shepherd built before `DogSheepSettings` says to
+    // a request it has no verb for, and `Unrecognized` is a code this build
+    // was not taught. Neither is a fault: nothing there can hold a table, so
+    // every sheep rotates on the section. No seam drives this over the fake
+    // shepherd, which cannot refuse that request, so the decision is pinned
+    // where it is made.
+    for code in [RpcErrorCode::Unsupported, RpcErrorCode::Unrecognized] {
+        let tables = tables_from(refused(code)).expect("an old shepherd is not an error");
+        assert!(tables.is_empty(), "{code:?}");
+    }
+}
+
+#[test]
+fn any_other_refusal_of_the_sheep_tables_still_stops_the_tick() {
+    for code in [
+        RpcErrorCode::Forbidden,
+        RpcErrorCode::Internal,
+        RpcErrorCode::DeadlineExceeded,
+    ] {
+        let err = tables_from(refused(code)).expect_err("a real fault is not swallowed");
+        assert!(matches!(err, Error::Shepherd(_)), "{code:?}: {err}");
+    }
+    let err = tables_from(Err(RequestError::Closed)).expect_err("a dropped link stops it");
+    assert!(matches!(err, Error::Shepherd(_)), "{err}");
+}
+
+#[test]
+fn the_tables_a_shepherd_answers_are_the_tables_used() {
+    let tables = BTreeMap::from([("web".to_owned(), DogTable::from(serde_json::Map::new()))]);
+    let got = tables_from(Ok(Response::DogSheepSettings {
+        tables: tables.clone(),
+    }))
+    .expect("answered");
+    assert_eq!(got, tables);
+    let err = tables_from(Ok(Response::Pong)).expect_err("a different answer is refused");
+    assert!(matches!(err, Error::Protocol(_)), "{err}");
+}
