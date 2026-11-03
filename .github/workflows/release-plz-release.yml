@@ -20,6 +20,14 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      dry-run-tag:
+        description: >-
+          An existing tag of this crate, e.g. v0.2.4. When set, also runs shep's
+          dog release workflow as a dry run against it: it builds every target
+          and prints the hashes, and uploads and opens nothing.
+        type: string
+        default: ""
 
 concurrency:
   group: release-plz-release
@@ -114,3 +122,24 @@ jobs:
       tag: ${{ fromJSON(needs.release-plz-release.outputs.releases)[0].tag }}
     secrets:
       index-token: ${{ secrets.SHEP_INDEX_TOKEN }}
+
+  # The dry run for the job above: by hand with a tag, it builds an existing
+  # release's binaries for every target and prints the hashes, so the path can
+  # be checked without spending a version number or opening a pull request on
+  # shep-pm/shep. `dog-release` cannot serve for this, since it runs only when
+  # release-plz released something and a dispatch on a released tag releases
+  # nothing. No `needs`: the dry run has no use for the release job's outcome.
+  # No secret, since a dry run opens no pull request. The permissions match the
+  # job above because a caller has to grant what the reusable workflow's
+  # `upload` job asks for, even when a dry run skips that job.
+  dog-release-dry-run:
+    name: Dry-run the binaries
+    if: github.event_name == 'workflow_dispatch' && inputs.dry-run-tag != ''
+    permissions:
+      contents: write
+      actions: read
+    uses: shep-pm/shep/.github/workflows/dog-release.yml@3e217f93ea0e7557b10bb3cdf45cd0755365cbb9
+    with:
+      package: shep-log-rotate
+      tag: ${{ inputs.dry-run-tag }}
+      dry-run: true
