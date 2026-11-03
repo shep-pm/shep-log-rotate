@@ -549,11 +549,11 @@ fn the_dog_reads_the_section_of_the_name_it_was_adopted_under() {
 fn a_section_the_dog_cannot_parse_stops_the_process() {
     // A real shepherd because the fake one serves whatever text it is
     // handed: only a daemon passing a hand-edited `dogs.toml` through
-    // proves this dog is the party that catches the value. `1d` is the
-    // value from the incident; shep's grammar has no day unit.
+    // proves this dog is the party that catches the value. `1w` has
+    // the shape of the value from the incident; shep's grammar has no week unit.
     let shepherd = Shepherd::new();
     let idle = write_script(shepherd.home(), "idle.sh", "#!/bin/sh\nsleep 300\n");
-    shepherd.write_config("[log-rotate]\nmax_age = \"1d\"\n");
+    shepherd.write_config("[log-rotate]\nmax_age = \"1w\"\n");
 
     // A shepherd has to be up, since the fault only reaches this dog as an
     // answer to `DogConfig`. A dog with no daemon to ask retries, which is
@@ -576,7 +576,7 @@ fn a_section_the_dog_cannot_parse_stops_the_process() {
         "a dog stopping on a config it cannot use exits ExitCode::FAILURE, which is 1"
     );
     let said = shepherd.dog_stderr();
-    for part in ["[log-rotate]", "dogs.toml", "max_age", "1d"] {
+    for part in ["[log-rotate]", "dogs.toml", "max_age", "1w"] {
         assert!(
             said.contains(part),
             "the line an operator finds in the log has to name {part}: {said:?}"
@@ -657,8 +657,13 @@ fn adopt_puts_a_dog_in_the_listing_and_rehome_takes_it_out() {
     // `disable` is `adopted_dogs`: a disabled dog comes back with `enable`,
     // a rehomed one needs a fresh `shep adopt <path>`.
     let registration = fs::read_to_string(shepherd.home().join("shep.toml")).unwrap_or_default();
+    // The registration is `enabled_dogs` and `adopted_dogs`. The grants table
+    // outlives it on purpose, so a dog adopted again is not silently widened.
+    let registered: toml::Table = registration.parse().expect("shep.toml is TOML");
+    let daemon = registered["daemon"].as_table().expect("a [daemon] table");
     assert!(
-        !registration.contains("weathervane"),
+        !daemon["enabled_dogs"].to_string().contains("weathervane")
+            && !daemon["adopted_dogs"].to_string().contains("weathervane"),
         "rehome strikes the registration, and shep.toml still names it: {registration}"
     );
     let settings = fs::read_to_string(shepherd.home().join("dogs.toml")).unwrap_or_default();

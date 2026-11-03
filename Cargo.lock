@@ -118,9 +118,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
- "js-sys",
  "num-traits",
- "wasm-bindgen",
  "windows-link",
 ]
 
@@ -151,9 +149,9 @@ dependencies = [
 
 [[package]]
 name = "croner"
-version = "3.0.1"
+version = "4.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4aa42bcd3d846ebf66e15bd528d1087f75d1c6c1c66ebff626178a106353c576"
+checksum = "26d09284075f5c87675790d1ad74212a7863eb8bdf228cdbd364f08a152fc62d"
 dependencies = [
  "chrono",
  "derive_builder",
@@ -870,23 +868,26 @@ dependencies = [
 
 [[package]]
 name = "shep-channel"
-version = "0.16.1"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9faac89b4ad1268078252f28bfdde3c2ed9deec12c0991cf82729a5926e47481"
+checksum = "14c0e5cd7965b65fb34130614e7bb876d7a37e1f002f24559e6c33c9df1aa0c3"
 dependencies = [
  "serde",
+ "serde_json",
+ "windows-sys",
 ]
 
 [[package]]
 name = "shep-client"
-version = "0.16.1"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3545478bcc171338d1f86fe123357744ab727e005346d53e210120ed8098f6a"
+checksum = "5cebab1d485167f415de2ad8c7e889b459d2d23fc31d69ea24641aa5c1aeb82e"
 dependencies = [
  "futures-util",
  "schemars",
  "serde",
  "serde_json",
+ "shep-channel",
  "shep-core",
  "shep-macros",
  "tokio",
@@ -897,9 +898,9 @@ dependencies = [
 
 [[package]]
 name = "shep-core"
-version = "0.16.1"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2ccbd50a8cb396b0dcb218786954e77b0b2d5e138d918fb2b59e270e8012608"
+checksum = "4171984d343685bcbdbeb9678bbe2efe13f7c3f05f83dcdb8accdec735c6166d"
 dependencies = [
  "annotate-snippets",
  "anstyle",
@@ -944,13 +945,13 @@ dependencies = [
 
 [[package]]
 name = "shep-macros"
-version = "0.16.1"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57665436c35a527043507c97701f41230dc838bd8999a9e523d40616611c2be5"
+checksum = "ea4c097b08df65b5639430b173f90b8a9de6d03018137a0cfcb946b1275e586a"
 dependencies = [
  "proc-macro2",
  "quote 1.0.47",
- "syn 2.0.119",
+ "syn 3.0.4",
 ]
 
 [[package]]

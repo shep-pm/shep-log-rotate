@@ -99,9 +99,9 @@ interval = "60s"    # how often to look
 | `compress` | `true` | The newest generation is left plain so it still greps without a decompression step. |
 | `interval` | `"60s"` | How long between passes. `0` is refused. |
 
-`max_age` and `interval` use shep's duration grammar, which has hours,
-minutes and seconds in lowercase and no day unit at all. A week is `"168h"`,
-not `"7d"`. A bare number is milliseconds, so `max_age = "7"` means seven
+`max_age` and `interval` use shep's duration grammar, which has days,
+hours, minutes, seconds and milliseconds in lowercase and no week unit. A week
+is `"7d"` or `"168h"`, not `"1w"`. A bare number is milliseconds, so `max_age = "7"` means seven
 milliseconds and not seven of anything else.
 
 The dog re-reads this table on every pass, so editing `dogs.toml` takes
@@ -251,7 +251,7 @@ that name in the output.
 
 ## A note on the dependency
 
-`Cargo.toml` reads `shep-client = "0.16.1"`, by version alone, from crates.io.
+`Cargo.toml` reads `shep-client = "0.23.0"`, by version alone, from crates.io.
 It carried a git URL alongside until shep published on 2026-08-26, which was the
 only thing blocking this crate from being published itself.
 
@@ -260,10 +260,10 @@ its session and `Client::dog_config` reads its section, so what this dog leans o
 is shep's own shape for a dog, and that shape moves with shep. `Cargo.toml` names
 the older release each piece arrived in and why each still holds: the
 `dog_config` attribute from 0.10.0, `DogRuntime` from 0.11.0, the resolved config
-request from 0.13.0, and `ReconnectingClient`'s dog-named handshake from 0.1.23,
+request from 0.13.0, the permission manifest from 0.17.0, and `ReconnectingClient`'s dog-named handshake from 0.1.23,
 which is still what keeps this dog from being rendered `silent` after a handover.
 
-The floor and the lockfile answer different questions. `^0.16.1` is the oldest
+The floor and the lockfile answer different questions. `^0.23.0` is the oldest
 client this code compiles against. `Cargo.lock` pins whichever release was
 newest when it was last refreshed, and that is what a reproducible build of
 this crate ships: `cargo install` honours a packaged lockfile under `--locked`,

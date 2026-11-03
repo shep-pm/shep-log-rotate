@@ -21,7 +21,7 @@
 use std::process::{Command, Output};
 
 use shep_client::shep_core::{
-    dogs::parse_version_answer,
+    dogs::{MANIFEST_FLAG, manifest::Manifest, parse_version_answer},
     protocol::{MIN_SUPPORTED, PROTOCOL_VERSION},
 };
 
@@ -106,9 +106,9 @@ fn the_protocol_this_dog_announces_is_one_a_shepherd_still_accepts() {
     // protocol, and somebody has to run the integration tier against a
     // shepherd built from that release before changing the number here.
     assert_eq!(
-        announced, 11,
+        announced, 15,
         "this dog announces protocol {announced}, and this crate was last verified against a \
-         shepherd speaking 11. Run the integration tier against the new shep before moving this."
+         shepherd speaking 15. Run the integration tier against the new shep before moving this."
     );
     assert!(
         announced >= MIN_SUPPORTED,
@@ -169,4 +169,25 @@ fn a_flag_this_binary_has_never_had_is_still_refused() {
         "the refusal names the flag: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn the_manifest_asks_for_exactly_the_permissions_the_tick_needs() {
+    // shep records a dog's grants from what its manifest asks for, and a
+    // shepherd that enforces them refuses any request outside. A dog that
+    // asks for nothing is granted nothing: it connects, reads its own
+    // section (a dog may always do that), and then every listing and every
+    // reopen is Forbidden, so it rotates nothing and says so only in a log.
+    let output = probe(MANIFEST_FLAG);
+    answered_cleanly(&output, MANIFEST_FLAG);
+
+    let manifest: Manifest = serde_json::from_str(&stdout(&output)).expect("the answer is JSON");
+    let mut asked: Vec<(&str, bool)> = manifest
+        .permissions
+        .iter()
+        .map(|permission| (permission.name.as_str(), permission.required))
+        .collect();
+    asked.sort_unstable();
+    assert_eq!(asked, [("flock.read", true), ("logs.manage", true)]);
+    assert_eq!(manifest.name, "shep-log-rotate");
 }
