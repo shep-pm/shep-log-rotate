@@ -127,6 +127,15 @@ pub enum ConfigError {
     /// Names the key and never the value. A sheep's table is not this dog's
     /// to quote, and the parser's own message quotes the value.
     Key(String),
+    /// A value in a sheep's own table that is not spelled the way shep spells
+    /// it: a size, a duration or a naming scheme this dog cannot use.
+    ///
+    /// Names the key and never the value, for the same reason as
+    /// [`Self::Key`]: the line it ends up on is a log line, and a sheep's
+    /// table is not this dog's to quote. [`Self::Size`], [`Self::Duration`]
+    /// and [`Self::Naming`] quote theirs, which is right for the dog's own
+    /// section that the operator wrote and is reading the complaint about.
+    Value(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -170,6 +179,10 @@ impl fmt::Display for ConfigError {
                 f,
                 "{key} is not a setting this dog can read: an unknown key, or a value of the wrong type"
             ),
+            Self::Value(key) => write!(
+                f,
+                "{key} is not spelled the way shep spells it: see the README for the spellings"
+            ),
         }
     }
 }
@@ -184,7 +197,8 @@ impl core::error::Error for ConfigError {
             | Self::Keep
             | Self::Interval
             | Self::DogWide(_)
-            | Self::Key(_) => None,
+            | Self::Key(_)
+            | Self::Value(_) => None,
         }
     }
 }
@@ -277,6 +291,24 @@ pub struct Section {
     interval: Option<String>,
 }
 
+/// `err` with the value it quotes taken out, for an error that came off a
+/// sheep's own table.
+///
+/// `from_section` is shared with the dog's own section, where quoting the
+/// value is right: the operator wrote it and is reading the complaint. A
+/// sheep's value ends up in a log line and may be a secret reference, so the
+/// three variants that carry one become [`ConfigError::Value`], which names
+/// the key alone. The others carry no value of the operator's.
+fn withhold_value(err: ConfigError) -> ConfigError {
+    match err {
+        ConfigError::Size { field, .. } | ConfigError::Duration { field, .. } => {
+            ConfigError::Value(field.to_owned())
+        }
+        ConfigError::Naming(_) => ConfigError::Value("naming".to_owned()),
+        other => other,
+    }
+}
+
 /// The keys of [`Section`] the schema marks `#[shep(dog_wide)]`.
 ///
 /// Read off the schema this dog publishes rather than listed a second time,
@@ -366,7 +398,9 @@ impl Config {
     /// - [`ConfigError::DogWide`] - `own` sets a key only the section may.
     /// - [`ConfigError::Key`] - a key of the layered table is one this dog
     ///   cannot read.
-    /// - Every error [`Self::from_toml`] gives for a value it cannot use.
+    /// - [`ConfigError::Value`] - a value is not spelled the way shep spells
+    ///   it. The key is named and the value is not.
+    /// - [`ConfigError::Keep`] - `keep = 0`.
     pub fn for_sheep(&self, section: &DogTable, own: &DogTable) -> Result<Self, ConfigError> {
         let dog_wide = dog_wide_keys();
         let set_here: Vec<String> = own
@@ -397,7 +431,7 @@ impl Config {
             })?;
         Ok(Self {
             interval: self.interval,
-            ..Self::from_section(raw)?
+            ..Self::from_section(raw).map_err(withhold_value)?
         })
     }
 
@@ -648,6 +682,29 @@ interval = "5s"
             );
             assert_no_dashes(&shown);
         }
+    }
+
+    #[test]
+    fn a_value_a_sheep_spells_wrongly_is_not_quoted_either() {
+        // `from_toml` quotes the value, and rightly: it is the operator's own
+        // section. A sheep's table reaches a log line, so its keys are named
+        // and its values are not, whichever grammar they failed.
+        for (own, key) in [
+            ("max_size = \"hunter2\"\n", "max_size"),
+            ("max_age = \"hunter2\"\n", "max_age"),
+            ("naming = \"hunter2\"\n", "naming"),
+        ] {
+            let err = for_sheep("", own).expect_err("refused");
+            let shown = err.to_string();
+            assert!(shown.starts_with(key), "{shown}");
+            assert!(!shown.contains("hunter2"), "{shown}");
+            assert_no_dashes(&shown);
+        }
+        let section = Config::from_toml("max_size = \"hunter2\"\n").expect_err("refused");
+        assert!(
+            section.to_string().contains("hunter2"),
+            "the section's own complaint still quotes it"
+        );
     }
 
     #[test]
