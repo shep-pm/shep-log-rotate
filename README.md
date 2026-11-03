@@ -63,8 +63,10 @@ passing `--home`.
 
 ## Configuration
 
-Everything lives in one table in `dogs.toml`, next to `shep.toml` in your
-shep home. Ask the binary for a starting point:
+The dog's own settings live in one table in `dogs.toml`, next to `shep.toml`
+in your shep home, and they are the value for every sheep. A sheep can set
+its own on top of them, in its own config: see "Setting a rule for one
+sheep" below. Ask the binary for a starting point:
 
 ```sh
 shep-log-rotate --print-config >> ~/.shep/dogs.toml
@@ -157,9 +159,12 @@ in both addresses.
   line says which sheep and which key. The other sheep rotate as usual. A log
   that sheep shares with another sheep is left alone for both, since a sheep
   that is not reopened would go on writing into the renamed file.
-- A rotated generation is pruned by the rules of the sheep that rotated it.
-  Two sheep sharing one log path share its verdict: the first sheep in the
-  flock's order decides whether it has grown enough.
+- Two sheep sharing one log path are one log to this dog. The first sheep in
+  the flock's order decides whether it has grown enough to rotate, with its
+  own `max_size` and `max_age`. The sheep that then renames it, normally that
+  same sheep, names the new generation and prunes and compresses the
+  generations by its own `naming`, `keep` and `compress`. The other sheep's
+  settings for that path are not consulted.
 
 ## The two naming schemes
 
