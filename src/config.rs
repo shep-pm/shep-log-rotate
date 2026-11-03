@@ -600,6 +600,62 @@ interval = "5s"
         );
     }
 
+    /// `own` as the table a sheep carries, laid over `section_text`.
+    fn for_sheep(section_text: &str, own: &str) -> Result<Config, ConfigError> {
+        let base = Config::from_toml(section_text).expect("a valid section");
+        let section = Config::section_table(section_text).expect("TOML");
+        let own = Config::section_table(own).expect("TOML");
+        base.for_sheep(&section, &own)
+    }
+
+    #[test]
+    fn a_sheeps_table_is_laid_over_the_section_key_by_key() {
+        let config = for_sheep(
+            "max_size = \"1K\"\nkeep = 7\ninterval = \"5s\"\n",
+            "keep = 2\n",
+        )
+        .expect("valid");
+        assert_eq!(config.keep, 2);
+        assert_eq!(config.max_size.bytes(), 1024);
+        assert_eq!(
+            config.interval.as_duration().as_secs(),
+            5,
+            "the one loop's interval"
+        );
+    }
+
+    #[test]
+    fn a_sheeps_table_cannot_set_what_is_dog_wide() {
+        let err = for_sheep("", "interval = \"1s\"\nkeep = 2\n").expect_err("refused");
+        let shown = err.to_string();
+        assert!(shown.contains("interval"), "{shown}");
+        assert!(!shown.contains("keep"), "only the offending key: {shown}");
+        assert_no_dashes(&shown);
+    }
+
+    #[test]
+    fn a_key_a_sheep_cannot_use_is_named_and_its_value_is_not() {
+        for own in ["keep = \"hunter2\"\n", "hunter2 = 1\n"] {
+            let err = for_sheep("", own).expect_err("refused");
+            let shown = err.to_string();
+            assert!(
+                shown.starts_with("keep ") || shown.starts_with("hunter2 "),
+                "{shown}"
+            );
+            assert!(
+                !shown.contains("\"hunter2\""),
+                "a sheep's value is not quoted: {shown}"
+            );
+            assert_no_dashes(&shown);
+        }
+    }
+
+    #[test]
+    fn the_dog_wide_keys_are_the_ones_the_schema_marks() {
+        let keys: Vec<&str> = dog_wide_keys().iter().map(String::as_str).collect();
+        assert_eq!(keys, ["interval"]);
+    }
+
     #[test]
     fn the_printed_block_carries_no_em_dash() {
         assert_no_dashes(PRINT_CONFIG);

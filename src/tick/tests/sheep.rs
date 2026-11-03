@@ -104,7 +104,9 @@ async fn a_table_that_does_not_parse_leaves_that_sheep_alone_and_the_rest_rotate
     assert!(!api.exists(), "api still rotates");
     assert_eq!(*fake.reopened.borrow(), vec!["api".to_owned()]);
 
-    let line = report.summary().expect("a left-alone sheep is worth a line");
+    let line = report
+        .summary()
+        .expect("a left-alone sheep is worth a line");
     assert_eq!(line.matches("web").count(), 1, "{line}");
     assert!(line.contains("max_size"), "names the key: {line}");
     assert!(!line.contains("api"), "{line}");
@@ -156,11 +158,14 @@ async fn a_sheep_sharing_a_log_with_one_left_alone_does_not_rotate_it_either() {
 async fn a_table_on_a_sheep_the_flock_does_not_hold_changes_nothing() {
     let dir = tempfile::tempdir().expect("tempdir");
     let web = seed(dir.path(), "web.log", 5000);
-    let fake = Fake::new(SECTION, vec![sheep("web", Some(&web), None)])
-        .with_table("ghost", "keep = 0\n");
+    let fake =
+        Fake::new(SECTION, vec![sheep("web", Some(&web), None)]).with_table("ghost", "keep = 0\n");
 
     let (_config, report) = run(&fake, SystemTime::now()).await.expect("ticked");
 
     assert_eq!(report.rotated, 1);
-    assert_eq!(report.summary().map(|line| line.contains("ghost")), Some(false));
+    assert_eq!(
+        report.summary().map(|line| line.contains("ghost")),
+        Some(false)
+    );
 }

@@ -1,5 +1,6 @@
-//! One poll of the rotator's loop: read the config, list the flock, rename
-//! what has grown, ask the shepherd to reopen, then compress and prune.
+//! One poll of the rotator's loop: read the config and each sheep's own
+//! table, list the flock, rename what has grown, ask the shepherd to reopen,
+//! then compress and prune.
 //!
 //! This is the only module that speaks to the daemon, and it is where the
 //! two guards no earlier module could enforce live.
@@ -264,11 +265,15 @@ fn times(n: usize) -> String {
 ///
 /// The order is load-bearing:
 ///
-/// 1. Read the config. Never cached: the daemon re-reads its side per
-///    request, and a dog that cached this would undo that, so changing
-///    `max_size` would need a `shep disable` and a `shep enable` rather than
-///    taking effect on the next tick.
-/// 2. List the flock, and build the protected set from all of it.
+/// 1. Read the config, and every sheep's own table over it. Never cached:
+///    the daemon re-reads its side per request, and a dog that cached this
+///    would undo that, so changing `max_size` would need a `shep disable` and
+///    a `shep enable` rather than taking effect on the next tick. A sheep
+///    whose table does not parse is left alone this tick, and so is every log
+///    it shares with another sheep, because the sheep that does not parse
+///    would never be reopened after a rename.
+/// 2. List the flock, and build the protected set from all of it, left-alone
+///    sheep included.
 /// 3. Stat and qualify every log path, before renaming any of them, so that
 ///    two sheep sharing one path both see it as it was.
 /// 4. Per sheep: rename its qualifying files, then reopen that sheep alone.
@@ -298,9 +303,10 @@ fn times(n: usize) -> String {
 /// # Errors
 /// - [`Error::Config`] if the `[<name>]` section cannot be understood.
 ///   Nothing is touched in that case; the tick reads the config first for
-///   exactly that reason.
-/// - [`Error::Shepherd`] or [`Error::Protocol`] if the config or the flock
-///   listing cannot be had. A refused *reopen* is not an error: it is
+///   exactly that reason. A sheep's own table that cannot be understood is
+///   not this error: it is reported in [`Report::left_alone`].
+/// - [`Error::Shepherd`] or [`Error::Protocol`] if the config, the sheep's
+///   tables or the flock listing cannot be had. A refused *reopen* is not an error: it is
 ///   reported in [`Report::reopen_failed`], because shep is still writing into
 ///   the renamed file through its existing descriptor, so nothing is lost and
 ///   the next successful reopen recovers.
@@ -339,7 +345,10 @@ pub async fn tick<D: Daemon>(
     let tables = daemon.sheep_tables(dog_name).await?;
     let flock = daemon.list_flock().await?;
     let mut report = Report::default();
-    let Rules { settings, left_alone } = sheep_rules(&config, &section, &tables, &flock, &mut report);
+    let Rules {
+        settings,
+        left_alone,
+    } = sheep_rules(&config, &section, &tables, &flock, &mut report);
     // Every live log path the flock reported, in one set, because the
     // collision it exists to catch is between different sheep.
     let protected = Arc::new(FileSet::from_paths(
@@ -396,8 +405,7 @@ pub async fn tick<D: Daemon>(
                         // file yet, and that is normal rather than broken.
                         Err(_) => Verdict::Skip,
                         Ok(metadata) => {
-                            match qualifies(&base, &file.0, &metadata, rules, now, &mut listings)
-                            {
+                            match qualifies(&base, &file.0, &metadata, rules, now, &mut listings) {
                                 // One directory this dog cannot read is
                                 // that log's problem, said so, and not a
                                 // reason to leave every other log alone.
