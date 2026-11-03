@@ -659,11 +659,18 @@ fn adopt_puts_a_dog_in_the_listing_and_rehome_takes_it_out() {
     let registration = fs::read_to_string(shepherd.home().join("shep.toml")).unwrap_or_default();
     // The registration is `enabled_dogs` and `adopted_dogs`. The grants table
     // outlives it on purpose, so a dog adopted again is not silently widened.
+    // An absent file, table or key is an empty registration, not a failure:
+    // a serializer that skips empty lists leaves them out.
     let registered: toml::Table = registration.parse().expect("shep.toml is TOML");
-    let daemon = registered["daemon"].as_table().expect("a [daemon] table");
+    let still_registered = ["enabled_dogs", "adopted_dogs"].iter().any(|key| {
+        registered
+            .get("daemon")
+            .and_then(toml::Value::as_table)
+            .and_then(|daemon| daemon.get(*key))
+            .is_some_and(|value| value.to_string().contains("weathervane"))
+    });
     assert!(
-        !daemon["enabled_dogs"].to_string().contains("weathervane")
-            && !daemon["adopted_dogs"].to_string().contains("weathervane"),
+        !still_registered,
         "rehome strikes the registration, and shep.toml still names it: {registration}"
     );
     let settings = fs::read_to_string(shepherd.home().join("dogs.toml")).unwrap_or_default();
