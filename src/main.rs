@@ -180,7 +180,7 @@ impl Action {
     /// understand --print-config", which is a confusing thing to tell
     /// somebody who plainly does.
     ///
-    /// `--version`, `--schema` and `--shep-manifest` are refused here and answered elsewhere,
+    /// `--version` and `--schema` are refused here and answered elsewhere,
     /// which is not a contradiction. `probe` reads the first argument,
     /// because the first argument is the only one shep passes a candidate
     /// binary, so a probe flag anywhere else reaches this parser instead.
@@ -194,7 +194,7 @@ impl Action {
                 "--help" | "-h" => {
                     return Err(Usage("shep-log-rotate takes no options.".to_owned()));
                 }
-                probe @ ("--version" | "--schema" | "--shep-manifest") => {
+                probe @ ("--version" | "--schema") => {
                     return Err(Usage(format!(
                         "shep-log-rotate answers {probe} as its first argument only, which is \
                          where the shepherd asks it."
