@@ -14,12 +14,16 @@
 //! which the daemon refuses to boot on rather than guess between.
 
 use core::fmt;
+use std::{collections::BTreeSet, sync::OnceLock};
 
 use schemars::JsonSchema;
 use serde::Deserialize;
 use shep_client::{
-    dogs::dog_config,
-    shep_core::values::{MemSize, ParseMemSizeError, ParseUpDurationError, UpDuration},
+    dogs::{DOG_WIDE_KEY, config_schema, dog_config},
+    shep_core::{
+        config::DogTable,
+        values::{MemSize, ParseMemSizeError, ParseUpDurationError, UpDuration},
+    },
 };
 
 /// How rotated generations are named. See the README for the trade-off.
@@ -114,6 +118,15 @@ pub enum ConfigError {
     /// `interval = 0`, which would ask the shepherd again the moment an
     /// answer came back.
     Interval,
+    /// A sheep's own table set a key that is dog-wide, so it belongs in the
+    /// dog's section.
+    DogWide(Vec<String>),
+    /// A key in a sheep's own table, or the section under it, that this dog
+    /// cannot read: one it has never had, or a value of the wrong type.
+    ///
+    /// Names the key and never the value. A sheep's table is not this dog's
+    /// to quote, and the parser's own message quotes the value.
+    Key(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -148,6 +161,15 @@ impl fmt::Display for ConfigError {
                 f,
                 "interval = 0 would ask the shepherd without pause; interval must be above 0"
             ),
+            Self::DogWide(keys) => write!(
+                f,
+                "{} is dog-wide: set it in the dog's own section of dogs.toml, not in a sheep's table",
+                keys.join(", ")
+            ),
+            Self::Key(key) => write!(
+                f,
+                "{key} is not a setting this dog can read: an unknown key, or a value of the wrong type"
+            ),
         }
     }
 }
@@ -157,7 +179,12 @@ impl core::error::Error for ConfigError {
         match self {
             Self::Size { source, .. } => Some(source),
             Self::Duration { source, .. } => Some(source),
-            Self::Toml(_) | Self::Naming(_) | Self::Keep | Self::Interval => None,
+            Self::Toml(_)
+            | Self::Naming(_)
+            | Self::Keep
+            | Self::Interval
+            | Self::DogWide(_)
+            | Self::Key(_) => None,
         }
     }
 }
@@ -243,9 +270,34 @@ pub struct Section {
     naming: Option<String>,
     /// gzip rotated generations. The newest is left plain so it stays greppable.
     compress: Option<bool>,
-    /// How often to look for a log worth rotating.
+    /// How often to look for a log worth rotating. One setting for the whole
+    /// flock: a sheep's own table cannot set it.
+    #[shep(dog_wide)]
     #[schemars(with = "Option<UpDuration>")]
     interval: Option<String>,
+}
+
+/// The keys of [`Section`] the schema marks `#[shep(dog_wide)]`.
+///
+/// Read off the schema this dog publishes rather than listed a second time,
+/// so the keys a sheep's table is refused and the keys the schema tells the
+/// shepherd about cannot drift apart.
+fn dog_wide_keys() -> &'static BTreeSet<String> {
+    static KEYS: OnceLock<BTreeSet<String>> = OnceLock::new();
+    KEYS.get_or_init(|| {
+        let schema = config_schema::<Section>();
+        schema
+            .as_value()
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .into_iter()
+            .flatten()
+            .filter(|(_, property)| {
+                property.get(DOG_WIDE_KEY) == Some(&serde_json::Value::Bool(true))
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
+    })
 }
 
 /// Parse `value` into a [`MemSize`], naming `field` in the error.
@@ -289,6 +341,72 @@ impl Config {
     pub fn from_toml(text: &str) -> Result<Self, ConfigError> {
         let raw: Section =
             toml::from_str(text).map_err(|err| ConfigError::Toml(err.to_string()))?;
+        Self::from_section(raw)
+    }
+
+    /// The `[<name>]` section's text as the table a sheep's own table is
+    /// layered over.
+    ///
+    /// # Errors
+    /// [`ConfigError::Toml`] - the text is not valid TOML.
+    pub fn section_table(text: &str) -> Result<DogTable, ConfigError> {
+        toml::from_str::<serde_json::Map<String, serde_json::Value>>(text)
+            .map(DogTable::from)
+            .map_err(|err| ConfigError::Toml(err.to_string()))
+    }
+
+    /// The settings one sheep rotates on: `section` without its dog-wide keys,
+    /// then the sheep's `own` table over it. Every key `own` leaves unset is
+    /// the section's, and `interval` is always `self`'s: there is one loop.
+    ///
+    /// `self` is the whole section read once, and `section` the same text as
+    /// a table, which is what a layer can be laid over.
+    ///
+    /// # Errors
+    /// - [`ConfigError::DogWide`] - `own` sets a key only the section may.
+    /// - [`ConfigError::Key`] - a key of the layered table is one this dog
+    ///   cannot read.
+    /// - Every error [`Self::from_toml`] gives for a value it cannot use.
+    pub fn for_sheep(&self, section: &DogTable, own: &DogTable) -> Result<Self, ConfigError> {
+        let dog_wide = dog_wide_keys();
+        let set_here: Vec<String> = own
+            .as_map()
+            .keys()
+            .filter(|key| dog_wide.contains(*key))
+            .cloned()
+            .collect();
+        if !set_here.is_empty() {
+            return Err(ConfigError::DogWide(set_here));
+        }
+        let mut shared = section.as_map().clone();
+        shared.retain(|key, _| !dog_wide.contains(key));
+        let merged = DogTable::layered(&[&DogTable::from(shared), own]).into_map();
+        let raw = serde_json::from_value::<Section>(serde_json::Value::Object(merged.clone()))
+            .map_err(|_| {
+                // The parser's message quotes the value, and a sheep's table
+                // is not this dog's to quote. A key read on its own names
+                // the fault without it.
+                let key = merged
+                    .iter()
+                    .find(|(key, value)| {
+                        let one = serde_json::Map::from_iter([((*key).clone(), (*value).clone())]);
+                        serde_json::from_value::<Section>(serde_json::Value::Object(one)).is_err()
+                    })
+                    .map_or_else(String::new, |(key, _)| key.clone());
+                ConfigError::Key(key)
+            })?;
+        Ok(Self {
+            interval: self.interval,
+            ..Self::from_section(raw)?
+        })
+    }
+
+    /// The settings a parsed [`Section`] stands for, each unset key at its
+    /// default.
+    ///
+    /// # Errors
+    /// As [`Self::from_toml`], past parsing the text.
+    pub fn from_section(raw: Section) -> Result<Self, ConfigError> {
         let defaults = Self::default();
         let interval = raw
             .interval

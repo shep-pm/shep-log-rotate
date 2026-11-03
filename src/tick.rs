@@ -40,7 +40,7 @@
 
 use core::{fmt, time::Duration};
 use std::{
-    collections::{BTreeMap, btree_map::Entry},
+    collections::{BTreeMap, BTreeSet, btree_map::Entry},
     fs,
     path::Path,
     sync::Arc,
@@ -50,7 +50,10 @@ use std::{
 use shep_client::{
     LinkState,
     dogs::DogRuntime,
-    shep_core::protocol::{ProcessInfo, Request, Response, SelectorSpec},
+    shep_core::{
+        config::DogTable,
+        protocol::{ProcessInfo, Request, Response, SelectorSpec},
+    },
 };
 
 use crate::{
@@ -88,6 +91,13 @@ pub trait Daemon {
     /// [`Error::Protocol`] if it answers with something other than a dog
     /// section.
     async fn dog_config(&self, name: &str) -> Result<String, Error>;
+
+    /// Each sheep's own `[app.dogs.<name>]` table, by sheep name. A sheep
+    /// with no such table is absent.
+    ///
+    /// # Errors
+    /// As [`Self::dog_config`].
+    async fn sheep_tables(&self, name: &str) -> Result<BTreeMap<String, DogTable>, Error>;
 
     /// Every supervised entry, dogs included.
     ///
@@ -170,6 +180,12 @@ pub struct Report {
     /// same directory and says so too. Anything here wants a human: it is a
     /// permissions problem.
     pub unlistable: Vec<String>,
+    /// Sheep left alone this tick because their own `[app.dogs.<name>]`
+    /// table could not be used, one message each naming the sheep and the
+    /// key. Their logs are neither rotated nor tidied, and a log they share
+    /// with another sheep is left alone for it too. The fault recurs next
+    /// tick until somebody edits the table.
+    pub left_alone: Vec<String>,
 }
 
 impl Report {
@@ -189,6 +205,7 @@ impl Report {
             && self.rename_failed.is_empty()
             && self.tidy_failed.is_empty()
             && self.unlistable.is_empty()
+            && self.left_alone.is_empty()
         {
             return None;
         }
@@ -210,6 +227,9 @@ impl Report {
         }
         if let Some(why) = &self.reopen_failed {
             line.push_str(&format!(", stopped early: reopen refused ({why})"));
+        }
+        for why in &self.left_alone {
+            line.push_str(&format!(", left {why}"));
         }
         for (what, faults) in [
             ("rename", &self.rename_failed),
@@ -309,18 +329,32 @@ pub async fn tick<D: Daemon>(
     // section is `[<name>]` for whatever this dog was adopted as, and an
     // error naming some other block sends the reader to a section they never
     // wrote.
-    let config =
-        Config::from_toml(&daemon.dog_config(dog_name).await?).map_err(|source| Error::Config {
-            section: dog_name.to_owned(),
-            source,
-        })?;
+    let in_section = |source| Error::Config {
+        section: dog_name.to_owned(),
+        source,
+    };
+    let text = daemon.dog_config(dog_name).await?;
+    let config = Config::from_toml(&text).map_err(in_section)?;
+    let section = Config::section_table(&text).map_err(in_section)?;
+    let tables = daemon.sheep_tables(dog_name).await?;
     let flock = daemon.list_flock().await?;
+    let mut report = Report::default();
+    let Rules { settings, left_alone } = sheep_rules(&config, &section, &tables, &flock, &mut report);
     // Every live log path the flock reported, in one set, because the
     // collision it exists to catch is between different sheep.
     let protected = Arc::new(FileSet::from_paths(
         flock.iter().flat_map(log_paths).map(Path::new),
     ));
-    let mut report = Report::default();
+    // Every path a sheep left alone writes to. Another sheep sharing one would
+    // rename it out from under a sheep that is never reopened, so the file is
+    // left alone for everyone.
+    let held = FileSet::from_paths(
+        flock
+            .iter()
+            .filter(|sheep| left_alone.contains(&sheep.name))
+            .flat_map(log_paths)
+            .map(Path::new),
+    );
 
     // Qualify the whole flock before renaming anything. Two sheep can share
     // one log path (`merge_logs`, or an explicit `out_file` on a
@@ -340,6 +374,7 @@ pub async fn tick<D: Daemon>(
     // one stat per file is what pins it.
     let mut verdicts: BTreeMap<(ResolvedDir, String), Verdict> = BTreeMap::new();
     for sheep in &flock {
+        let rules = settings.get(&sheep.name).unwrap_or(&config);
         for path in log_paths(sheep) {
             // A path this dog cannot spell is a path it must not go on to
             // rename or delete. `LogPath::split` refuses a non-UTF-8 name,
@@ -350,6 +385,9 @@ pub async fn tick<D: Daemon>(
                 continue;
             };
             let file = (protected.resolve(&base.dir), base.live_name());
+            if held.contains(&file.0, &file.1) {
+                continue;
+            }
             let verdict = match verdicts.get(&file) {
                 Some(verdict) => *verdict,
                 None => {
@@ -358,7 +396,7 @@ pub async fn tick<D: Daemon>(
                         // file yet, and that is normal rather than broken.
                         Err(_) => Verdict::Skip,
                         Ok(metadata) => {
-                            match qualifies(&base, &file.0, &metadata, &config, now, &mut listings)
+                            match qualifies(&base, &file.0, &metadata, rules, now, &mut listings)
                             {
                                 // One directory this dog cannot read is
                                 // that log's problem, said so, and not a
@@ -406,7 +444,7 @@ pub async fn tick<D: Daemon>(
     let mut renamed = FileSet::default();
     // Bases whose sheep has reopened, so shep has stopped writing into what
     // was renamed. Only those are safe to compress or delete.
-    let mut to_tidy: Vec<LogPath> = Vec::new();
+    let mut to_tidy: Vec<(LogPath, Config)> = Vec::new();
     // Files some sheep failed to rename this tick. A later sheep sharing
     // the file can succeed where that one failed, and the first sheep,
     // reopened before the file moved or never reopened at all, then writes
@@ -433,8 +471,9 @@ pub async fn tick<D: Daemon>(
         // reopen it, so it still gets the reopen it needs. That costs one
         // request and starts no rename.
         let stopping = stop.requested();
+        let rules = settings.get(name).unwrap_or(&config);
         let mut rotated_any = false;
-        let mut rotated_here: Vec<LogPath> = Vec::new();
+        let mut rotated_here: Vec<(LogPath, Config)> = Vec::new();
         for base in &groups[name] {
             // Through `protected` rather than `ResolvedDir::of`, so this
             // base is resolved the way the protected set was, at the moment
@@ -451,14 +490,14 @@ pub async fn tick<D: Daemon>(
             if stopping {
                 continue;
             }
-            if collides_with_a_live_log(base, &dir, config.naming, &protected) {
+            if collides_with_a_live_log(base, &dir, rules.naming, &protected) {
                 report.skipped_collision += 1;
                 continue;
             }
-            match rotate(base, config.naming, now) {
+            match rotate(base, rules.naming, now) {
                 Ok(_generation) => {
                     renamed.insert(dir, live_name);
-                    rotated_here.push(base.clone());
+                    rotated_here.push((base.clone(), rules.clone()));
                     report.rotated += 1;
                     rotated_any = true;
                 }
@@ -499,11 +538,55 @@ pub async fn tick<D: Daemon>(
             still_writing.insert(protected.resolve(&base.dir), base.live_name());
         }
     }
-    to_tidy
-        .retain(|base| !still_writing.contains(&protected.resolve(&base.dir), &base.live_name()));
+    to_tidy.retain(|(base, _)| {
+        !still_writing.contains(&protected.resolve(&base.dir), &base.live_name())
+    });
 
-    tidy_all(&to_tidy, &config, &protected, &mut report, stop).await;
+    tidy_all(&to_tidy, &protected, &mut report, stop).await;
     Ok((config, report))
+}
+
+/// What [`sheep_rules`] settled for the flock.
+struct Rules {
+    /// The settings of each sheep whose own table parsed, by sheep name. A
+    /// sheep with no table is absent, and rotates on the section's.
+    settings: BTreeMap<String, Config>,
+    /// The sheep whose own table did not parse.
+    left_alone: BTreeSet<String>,
+}
+
+/// Lay each sheep's own table over `section`, once per tick.
+///
+/// A table that does not parse leaves that sheep alone this tick and says
+/// so in `report`. It is that sheep's problem, so the others still rotate. A
+/// table on a name the flock does not hold is ignored: there is nothing it
+/// could rotate, and nothing it could leave alone.
+fn sheep_rules(
+    config: &Config,
+    section: &DogTable,
+    tables: &BTreeMap<String, DogTable>,
+    flock: &[ProcessInfo],
+    report: &mut Report,
+) -> Rules {
+    let mut rules = Rules {
+        settings: BTreeMap::new(),
+        left_alone: BTreeSet::new(),
+    };
+    for (name, own) in tables {
+        if !flock.iter().any(|sheep| sheep.name == *name) {
+            continue;
+        }
+        match config.for_sheep(section, own) {
+            Ok(settings) => {
+                rules.settings.insert(name.clone(), settings);
+            }
+            Err(why) => {
+                report.left_alone.push(format!("{name} alone ({why})"));
+                rules.left_alone.insert(name.clone());
+            }
+        }
+    }
+    rules
 }
 
 /// Compress and prune each of `bases`, adding what happened to `report`.
@@ -528,13 +611,12 @@ pub async fn tick<D: Daemon>(
 /// listed; the next generation and the next base are still tidied. The
 /// fault is that generation's, and the generation is left as it was.
 async fn tidy_all(
-    bases: &[LogPath],
-    config: &Config,
+    bases: &[(LogPath, Config)],
     protected: &Arc<FileSet>,
     report: &mut Report,
     stop: &mut Stop,
 ) {
-    for base in bases {
+    for (base, config) in bases {
         if stop.requested() {
             return;
         }
@@ -777,6 +859,16 @@ impl Daemon for Live {
         Ok(self.0.client().dog_config(name).await?.as_str().to_owned())
     }
 
+    async fn sheep_tables(&self, name: &str) -> Result<BTreeMap<String, DogTable>, Error> {
+        let asked = Request::DogSheepSettings {
+            dog: name.to_owned(),
+        };
+        match self.0.client().request(asked).await? {
+            Response::DogSheepSettings { tables } => Ok(tables),
+            other => Err(unexpected("DogSheepSettings", &other)),
+        }
+    }
+
     async fn list_flock(&self) -> Result<Vec<ProcessInfo>, Error> {
         match self.0.client().request(Request::ListFlock).await? {
             Response::Flock(flock) => Ok(flock),
@@ -811,6 +903,9 @@ fn named(response: &Response) -> String {
         Response::Pong => "Pong".to_owned(),
         Response::Flock(flock) => format!("a Flock of {}", flock.len()),
         Response::DogSection { .. } => "a DogSection".to_owned(),
+        Response::DogSheepSettings { tables } => {
+            format!("a DogSheepSettings of {}", tables.len())
+        }
         Response::Reopened(sheep) => format!("a Reopened of {}", sheep.len()),
         // `Response` is `#[non_exhaustive]`, so this arm is not optional. A
         // variant added to the protocol after this dog was written is
@@ -829,6 +924,7 @@ mod tests {
 
     mod live;
     mod reconnect;
+    mod sheep;
     mod stop;
     /// What a test runs on every reopen, handed the sheep's name.
     type Hook = Box<dyn Fn(&str)>;
@@ -836,6 +932,8 @@ mod tests {
     /// A daemon that answers from a script and records what it was asked.
     struct Fake {
         config: String,
+        /// Each sheep's own table, as TOML text.
+        tables: Vec<(String, String)>,
         flock: Vec<ProcessInfo>,
         reopen_fails: Option<String>,
         reopened: RefCell<Vec<String>>,
@@ -845,10 +943,17 @@ mod tests {
     }
 
     impl Fake {
+        /// This daemon, with `sheep` carrying `[app.dogs.<name>]` set to `table`.
+        fn with_table(mut self, sheep: &str, table: &str) -> Self {
+            self.tables.push((sheep.to_owned(), table.to_owned()));
+            self
+        }
+
         /// A daemon serving `config` and `flock` that grants every reopen.
         fn new(config: &str, flock: Vec<ProcessInfo>) -> Self {
             Self {
                 config: config.to_owned(),
+                tables: Vec::new(),
                 flock,
                 reopen_fails: None,
                 reopened: RefCell::new(Vec::new()),
@@ -860,6 +965,17 @@ mod tests {
     impl Daemon for Fake {
         async fn dog_config(&self, _name: &str) -> Result<String, Error> {
             Ok(self.config.clone())
+        }
+        async fn sheep_tables(&self, _name: &str) -> Result<BTreeMap<String, DogTable>, Error> {
+            Ok(self
+                .tables
+                .iter()
+                .map(|(sheep, text)| {
+                    let table: serde_json::Map<String, serde_json::Value> =
+                        toml::from_str(text).expect("a table the test wrote is TOML");
+                    (sheep.clone(), DogTable::from(table))
+                })
+                .collect())
         }
         async fn list_flock(&self) -> Result<Vec<ProcessInfo>, Error> {
             Ok(self.flock.clone())

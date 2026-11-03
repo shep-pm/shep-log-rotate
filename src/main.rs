@@ -441,6 +441,7 @@ fn main() -> ExitCode {
             true,
             "asks the shepherd to reopen a log after renaming it",
         ))
+        .serves_every_sheep()
         .answer::<config::Section>();
 
     let args: Vec<String> = std::env::args().skip(1).collect();

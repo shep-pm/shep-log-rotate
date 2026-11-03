@@ -11,6 +11,7 @@ use super::*;
 use shep_client::{
     dogs::{DogIdentity, DogRuntime},
     shep_core::{
+        config::DogTable,
         paths::ShepPaths,
         protocol::{RpcError, RpcErrorCode},
     },
@@ -159,4 +160,51 @@ async fn a_shepherd_too_old_to_resolve_still_gets_the_plain_ask() {
         "nothing fell back to the plain request: {:?}",
         asked(&handovers)
     );
+}
+
+#[tokio::test]
+async fn each_tick_asks_the_shepherd_for_the_sheeps_tables_and_applies_them() {
+    // Read every tick and never kept, like the section: a `shep set` on one
+    // sheep lands on the next tick. The tables come from the dog's own name,
+    // which is the one request about every sheep a dog may make unasked.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = control_address(dir.path());
+    let handovers = fake_daemon_across_handovers(&socket, vec![Handshake::Accept(sample_ack())]);
+    handovers.reply_to_dog_config("max_size = \"1M\"\n");
+    let out = dir.path().join("web-0-out.log");
+    fs::write(&out, "x".repeat(2048)).expect("seeded");
+    handovers.reply_to_list(vec![sheep("web", Some(&out), None)]);
+    handovers.reply_to_dog_sheep_settings(
+        [(
+            "web".to_owned(),
+            DogTable::from(
+                serde_json::json!({ "max_size": "1K" })
+                    .as_object()
+                    .cloned()
+                    .expect("an object"),
+            ),
+        )]
+        .into(),
+    );
+
+    let live = session(dir.path(), &socket, "weathervane").await;
+    for _ in 0..2 {
+        tick(&live, "weathervane", SystemTime::now(), &mut Stop::never())
+            .await
+            .expect("ticked");
+    }
+
+    let asked = asked(&handovers);
+    let tables: Vec<&Request> = asked
+        .iter()
+        .filter(|body| matches!(body, Request::DogSheepSettings { .. }))
+        .collect();
+    assert_eq!(tables.len(), 2, "once per tick: {asked:?}");
+    for body in tables {
+        match body {
+            Request::DogSheepSettings { dog } => assert_eq!(dog, "weathervane"),
+            other => unreachable!("{other:?} is not the request under test"),
+        }
+    }
+    assert!(!out.exists(), "web's own 1K applied to its 2K log");
 }

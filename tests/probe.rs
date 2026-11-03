@@ -21,7 +21,11 @@
 use std::process::{Command, Output};
 
 use shep_client::shep_core::{
-    dogs::{MANIFEST_FLAG, manifest::Manifest, parse_version_answer},
+    dogs::{
+        DOG_WIDE_KEY, MANIFEST_FLAG,
+        manifest::{Manifest, Serves},
+        parse_version_answer,
+    },
     protocol::{MIN_SUPPORTED, PROTOCOL_VERSION},
 };
 
@@ -190,4 +194,39 @@ fn the_manifest_asks_for_exactly_the_permissions_the_tick_needs() {
     asked.sort_unstable();
     assert_eq!(asked, [("flock.read", true), ("logs.manage", true)]);
     assert_eq!(manifest.name, "shep-log-rotate");
+}
+
+#[test]
+fn the_manifest_says_this_dog_serves_every_sheep() {
+    // A sheep with no `[app.dogs.log-rotate]` table of its own still rotates
+    // on `[log-rotate]`. Without the declaration the shepherd treats the dog
+    // as opt-in, so a sheep that never named it would be left out.
+    let output = probe(MANIFEST_FLAG);
+    answered_cleanly(&output, MANIFEST_FLAG);
+
+    let manifest: Manifest = serde_json::from_str(&stdout(&output)).expect("the answer is JSON");
+    assert_eq!(manifest.serves, Serves::EverySheep);
+}
+
+#[test]
+fn the_schema_marks_interval_dog_wide_and_nothing_else() {
+    // There is one poll loop, so a sheep cannot have its own `interval`. The
+    // mark is what makes the shepherd refuse a sheep's table that sets one.
+    let output = probe("--schema");
+    answered_cleanly(&output, "--schema");
+
+    let schema: serde_json::Value =
+        serde_json::from_str(&stdout(&output)).expect("the answer is JSON");
+    let properties = schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .expect("a form is built out of properties");
+
+    let mut dog_wide: Vec<&str> = properties
+        .iter()
+        .filter(|(_, property)| property.get(DOG_WIDE_KEY) == Some(&serde_json::Value::Bool(true)))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    dog_wide.sort_unstable();
+    assert_eq!(dog_wide, ["interval"]);
 }
