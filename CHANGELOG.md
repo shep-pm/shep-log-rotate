@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.9] - 2026-11-04
+
+### Changed
+
+- Move one sheep's renames into src/tick/rename.rs
+
+
 ## [0.2.8] - 2026-11-04
 
 ### Changed
