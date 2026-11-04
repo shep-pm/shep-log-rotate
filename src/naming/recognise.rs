@@ -43,11 +43,12 @@ impl Order {
     /// Named rather than written as a closure so the direction is legible at
     /// the call site, which is a delete path.
     ///
-    /// Dated generations order by `(stamp, counter)` descending. That the
-    /// counter is part of the key is not a detail: sorting the file names
-    /// lexicographically puts `...T15-04-05.1.log` *before*
-    /// `...T15-04-05.log`, because `'1' < 'l'`, which is backwards. Numeric
-    /// generations order by `n` ascending, because `.1` is the newest.
+    /// Dated generations order by `(stamp, counter)` descending. The counter
+    /// is in the key because it is what separates a same-second pair:
+    /// `rotate_dated` writes the plain name first, so `.1` is the newer one.
+    /// Sorting the names newest-first compares `'1'` with `'l'` where they
+    /// differ, which puts the plain name first. Numeric generations order by
+    /// `n` ascending, because `.1` is the newest.
     pub fn newest_first(a: &Self, b: &Self) -> Ordering {
         a.cmp(b)
     }
@@ -449,7 +450,8 @@ mod tests {
 
     #[test]
     fn newest_first_ordering_puts_the_counter_after_the_plain_name() {
-        // A plain lexicographic sort gets this backwards, because '1' < 'l'.
+        // A name sort newest-first gets this pair backwards, because
+        // '1' < 'l'.
         let mut orders = [
             dated("2026-08-20T15-04-05", 0),
             dated("2026-08-20T15-04-05", 2),
