@@ -382,8 +382,10 @@ pub async fn tick<D: Daemon>(
     // second one renamed. That race has no seam a test can drive, so the
     // one stat per file is what pins it.
     let mut verdicts: BTreeMap<(ResolvedDir, String), Verdict> = BTreeMap::new();
+    // The rules of every sheep that writes to each file, so that the one
+    // verdict is judged against all of them and not just the first sheep's.
+    let owners = owners_of(&flock, &settings, &config, &protected);
     for sheep in &flock {
-        let rules = settings.get(&sheep.name).unwrap_or(&config);
         for path in log_paths(sheep) {
             // A path this dog cannot spell is a path it must not go on to
             // rename or delete. `LogPath::split` refuses a non-UTF-8 name,
@@ -405,16 +407,16 @@ pub async fn tick<D: Daemon>(
                         // file yet, and that is normal rather than broken.
                         Err(_) => Verdict::Skip,
                         Ok(metadata) => {
-                            match qualifies(&base, &file.0, &metadata, rules, now, &mut listings) {
-                                // One directory this dog cannot read is
-                                // that log's problem, said so, and not a
-                                // reason to leave every other log alone.
-                                Listed::Unlistable(why) => {
-                                    report.unlistable.push(why);
-                                    Verdict::Leave
-                                }
-                                Listed::Verdict(verdict) => verdict,
-                            }
+                            let rules = owners.get(&file).map_or(&[][..], Vec::as_slice);
+                            judge(
+                                &base,
+                                &file.0,
+                                &metadata,
+                                rules,
+                                now,
+                                &mut listings,
+                                &mut report,
+                            )
                         }
                     };
                     verdicts.insert(file, verdict);
@@ -504,8 +506,22 @@ pub async fn tick<D: Daemon>(
             }
             match rotate(base, rules.naming, now) {
                 Ok(_generation) => {
+                    // The generations are pruned to the most any owner of
+                    // the file asked to keep, so no sheep sharing it loses
+                    // history it asked for. The renaming sheep's own rules
+                    // otherwise stand: it names and compresses.
+                    let keep = owners
+                        .get(&(dir.clone(), live_name.clone()))
+                        .and_then(|owned| owned.iter().map(|owner| owner.keep).max())
+                        .unwrap_or(rules.keep);
+                    rotated_here.push((
+                        base.clone(),
+                        Config {
+                            keep,
+                            ..rules.clone()
+                        },
+                    ));
                     renamed.insert(dir, live_name);
-                    rotated_here.push((base.clone(), rules.clone()));
                     report.rotated += 1;
                     rotated_any = true;
                 }
@@ -680,6 +696,68 @@ enum Verdict {
 enum Listed {
     Verdict(Verdict),
     Unlistable(String),
+}
+
+/// The rules of every sheep that writes to each log file, keyed the way the
+/// tick keys a file: the directory as `protected` resolves it, and the live
+/// name.
+///
+/// A sheep with no table of its own is an owner on the section's rules. A
+/// sheep left alone is one too, on those same rules, but its files are held
+/// and never reach a verdict, so what it says here is not read.
+fn owners_of<'a>(
+    flock: &[ProcessInfo],
+    settings: &'a BTreeMap<String, Config>,
+    config: &'a Config,
+    protected: &FileSet,
+) -> BTreeMap<(ResolvedDir, String), Vec<&'a Config>> {
+    let mut owners: BTreeMap<(ResolvedDir, String), Vec<&Config>> = BTreeMap::new();
+    for sheep in flock {
+        let rules = settings.get(&sheep.name).unwrap_or(config);
+        for path in log_paths(sheep) {
+            if let Some(base) = LogPath::split(Path::new(path)) {
+                owners
+                    .entry((protected.resolve(&base.dir), base.live_name()))
+                    .or_default()
+                    .push(rules);
+            }
+        }
+    }
+    owners
+}
+
+/// The one verdict for a log, judged against the rules of every sheep that
+/// writes to it: the file rotates when any owner's rules say it should.
+///
+/// The first sheep in the flock's order used to decide alone, so a log's fate
+/// depended on where its owners happened to be listed, and a sheep that asked
+/// for a tighter `max_size` or `max_age` was ignored if another came first.
+/// One owner wanting a rotation is reason enough, since declining it would
+/// refuse that sheep what its own table asked for. Every owner is asked even
+/// once one has said yes, so that a directory too unreadable to age a log by
+/// is reported whichever order the flock lists its owners in. The file is
+/// still stat-ed once, by the caller, and each owner reads it through the same
+/// `metadata`.
+fn judge(
+    base: &LogPath,
+    dir: &ResolvedDir,
+    metadata: &fs::Metadata,
+    owners: &[&Config],
+    now: SystemTime,
+    listings: &mut BTreeMap<ResolvedDir, Option<Vec<String>>>,
+    report: &mut Report,
+) -> Verdict {
+    let mut verdict = Verdict::Leave;
+    for rules in owners {
+        match qualifies(base, dir, metadata, rules, now, listings) {
+            // One directory this dog cannot read is that log's problem, said
+            // so, and not a reason to leave every other log alone.
+            Listed::Unlistable(why) => report.unlistable.push(why),
+            Listed::Verdict(Verdict::Rotate) => verdict = Verdict::Rotate,
+            Listed::Verdict(_) => {}
+        }
+    }
+    verdict
 }
 
 /// Whether a log has grown or aged past what `config` allows.

@@ -169,3 +169,112 @@ async fn a_table_on_a_sheep_the_flock_does_not_hold_changes_nothing() {
         Some(false)
     );
 }
+
+/// A flock of two sheep, `first` then `second`, both writing to one log.
+fn sharing(shared: &Path, first: &str, second: &str) -> Vec<ProcessInfo> {
+    vec![
+        sheep(first, Some(shared), None),
+        sheep(second, Some(shared), None),
+    ]
+}
+
+#[tokio::test]
+async fn a_log_two_sheep_share_rotates_when_either_owners_size_says_so() {
+    // One stat per file, judged against every owner's rules, so the answer is
+    // the same whichever owner the flock lists first. A 2K log is over the
+    // tight sheep's 1K and under the loose sheep's 1M.
+    for (first, second) in [("tight", "loose"), ("loose", "tight")] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shared = seed(dir.path(), "shared.log", 2048);
+        let fake = Fake::new(SECTION, sharing(&shared, first, second))
+            .with_table("tight", "max_size = \"1K\"\n")
+            .with_table("loose", "max_size = \"1M\"\n");
+
+        let (_config, report) = run(&fake, SystemTime::now()).await.expect("ticked");
+
+        assert_eq!(report.rotated, 1, "{first} then {second}");
+        assert!(!shared.exists(), "{first} then {second}: rotated away");
+        assert!(
+            dir.path().join("shared.log.2").exists(),
+            "{first} then {second}: the old .1 moved along"
+        );
+        assert_eq!(
+            *fake.reopened.borrow(),
+            vec![first.to_owned(), second.to_owned()],
+            "{first} then {second}: both owners are reopened"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_log_two_sheep_share_rotates_when_either_owners_age_says_so() {
+    // Small and young by one owner's rules, old by the other's. The age is
+    // read off the newest generation, `.1`, which `seed` wrote just now, so
+    // `now` is a year on.
+    for (first, second) in [("aging", "sized"), ("sized", "aging")] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shared = seed(dir.path(), "shared.log", 100);
+        let fake = Fake::new(SECTION, sharing(&shared, first, second))
+            .with_table("aging", "max_age = \"1d\"\n")
+            .with_table("sized", "max_size = \"1M\"\n");
+
+        let (_config, report) = run(&fake, a_year_on()).await.expect("ticked");
+
+        assert_eq!(report.rotated, 1, "{first} then {second}");
+        assert!(!shared.exists(), "{first} then {second}");
+    }
+}
+
+#[tokio::test]
+async fn a_log_two_sheep_share_is_not_rotated_when_neither_owner_wants_it() {
+    for (first, second) in [("a", "b"), ("b", "a")] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shared = seed(dir.path(), "shared.log", 2048);
+        let fake = Fake::new(SECTION, sharing(&shared, first, second))
+            .with_table("a", "max_size = \"1M\"\n")
+            .with_table("b", "max_size = \"2M\"\n");
+
+        let (_config, report) = run(&fake, SystemTime::now()).await.expect("ticked");
+
+        assert_eq!(report.rotated, 0, "{first} then {second}");
+        assert!(shared.exists());
+        assert!(fake.reopened.borrow().is_empty());
+    }
+}
+
+/// `.1` to `.count`, each a generation older than the last.
+fn seed_generations(dir: &Path, name: &str, count: usize) {
+    for n in 1..=count {
+        fs::write(dir.join(format!("{name}.{n}")), format!("gen {n}\n")).expect("seeded");
+    }
+}
+
+#[tokio::test]
+async fn a_log_two_sheep_share_keeps_the_most_any_owner_asked_for() {
+    // The tight sheep keeps 2 and the generous one keeps 5. Pruned to 2, the
+    // generous sheep would lose three generations it asked to keep, so the
+    // log keeps 5 whichever owner the flock lists first.
+    for (first, second) in [("tight", "generous"), ("generous", "tight")] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shared = dir.path().join("shared.log");
+        fs::write(&shared, "x".repeat(2048)).expect("seeded");
+        seed_generations(dir.path(), "shared.log", 5);
+        let fake = Fake::new(SECTION, sharing(&shared, first, second))
+            .with_table("tight", "keep = 2\nmax_size = \"1K\"\n")
+            .with_table("generous", "keep = 5\nmax_size = \"1K\"\n");
+
+        let (_config, report) = run(&fake, SystemTime::now()).await.expect("ticked");
+
+        assert_eq!(report.rotated, 1, "{first} then {second}");
+        for n in 1..=5 {
+            assert!(
+                dir.path().join(format!("shared.log.{n}")).exists(),
+                "{first} then {second}: generation {n} is within the larger keep"
+            );
+        }
+        assert!(
+            !dir.path().join("shared.log.6").exists(),
+            "{first} then {second}: and nothing past it"
+        );
+    }
+}
