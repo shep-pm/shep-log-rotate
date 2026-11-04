@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-11-04
+
+### Added
+
+- Rotate each sheep on its own settings layered over the section
+
+### Changed
+
+- Move the disk-fault tests into their own child module
+
+### Fixed
+
+- Read a shepherd without sheep tables as no tables
+- Keep a sheep's values out of the line that names its key
+- Judge a shared log against every owner's rules
+
+
 ## [0.2.4] - 2026-10-30
 
 
