@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.10] - 2026-11-04
+
+### Added
+
+- Declare the verb shep draws this dog's help from
+
+
 ## [0.2.9] - 2026-11-04
 
 ### Changed
