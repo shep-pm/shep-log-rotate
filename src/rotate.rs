@@ -211,8 +211,8 @@ fn rotate_numeric(base: &LogPath) -> Result<PathBuf, Error> {
         let Order::Numeric { n } = order else {
             unreachable!("generations(_, Naming::Numeric) only ever returns Order::Numeric")
         };
-        // naming.rs's own numeric_generations_compress_and_stop_at_u32 proves
-        // n == u32::MAX is a generation match_generation legitimately
+        // naming/recognise.rs's own numeric_generations_compress_and_stop_at_u32
+        // proves n == u32::MAX is a generation match_generation legitimately
         // recognises, so this is reachable by a planted file, not only in
         // theory. Wrapping would produce `.0` - not a name match_generation
         // ever matches back, so that generation would be orphaned rather
@@ -627,14 +627,15 @@ mod tests {
     }
 
     /// The `checked_add` guard in `rotate_numeric`, exercised for real:
-    /// naming.rs's own `numeric_generations_compress_and_stop_at_u32` proves
-    /// `.{u32::MAX}` is a name `match_generation` legitimately recognises,
-    /// so a single planted file reaches the overflow path directly - no
-    /// need to seed the 2^32 generations that would be needed to reach it
-    /// by counting up from `.1`. (The dated side's `counter` guard takes
-    /// the identical `checked_add`/`ok_or_else` shape but has no equivalent
-    /// shortcut - reaching it needs every counter from 0 to `u32::MAX` to
-    /// already exist - so it is exercised only by inspection, not a test.)
+    /// naming/recognise.rs's own `numeric_generations_compress_and_stop_at_u32`
+    /// proves `.{u32::MAX}` is a name `match_generation` legitimately
+    /// recognises, so a single planted file reaches the overflow path
+    /// directly - no need to seed the 2^32 generations that would be needed
+    /// to reach it by counting up from `.1`. (The dated side's `counter`
+    /// guard takes the identical `checked_add`/`ok_or_else` shape but has no
+    /// equivalent shortcut - reaching it needs every counter from 0 to
+    /// `u32::MAX` to already exist - so it is exercised only by inspection,
+    /// not a test.)
     #[test]
     fn a_numeric_generation_at_u32_max_refuses_rather_than_wraps() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -709,12 +710,12 @@ mod tests {
     }
 
     /// A directory can collide with a generation's name shape (an
-    /// operator's own subdirectory, say). `match_generation` in naming.rs
-    /// matches by name alone, so without a type check here it would be swept
-    /// into the shift and renamed away like real generation data - exactly
-    /// the mistake naming.rs's own docs warn about ("a false match costs an
-    /// operator their data"), just made one layer up from where those docs
-    /// live.
+    /// operator's own subdirectory, say). `match_generation` in
+    /// naming/recognise.rs matches by name alone, so without a type check here
+    /// it would be swept into the shift and renamed away like real generation
+    /// data - exactly the mistake naming.rs's own docs warn about ("a false
+    /// match costs an operator their data"), just made one layer up from
+    /// where those docs live.
     #[test]
     fn a_directory_that_matches_the_name_shape_is_not_a_generation() {
         let dir = tempfile::tempdir().expect("tempdir");
