@@ -109,7 +109,7 @@ reviews:
         Do not suggest widening an input grammar past what the code refuses. A
         refusal here is usually deliberate and says so in its own error.
 
-    - path: "src/prune.rs"
+    - path: "src/prune{.rs,/**/*.rs}"
       instructions: >-
         This file DELETES an operator's logs, which is the one thing this crate
         does that nothing can undo. A rotated generation removed too eagerly is
