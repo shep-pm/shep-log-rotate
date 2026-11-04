@@ -77,7 +77,7 @@ use std::{path::PathBuf, process::ExitCode, time::SystemTime};
 use shep_client::{
     ConnectError, LinkState,
     dogs::{DogIdentity, DogRuntime, Probe, ShepherdError},
-    shep_core::dogs::manifest::Permission,
+    shep_core::dogs::manifest::{Permission, Verb},
     shep_core::paths::ShepPaths,
     shep_core::values::UpDuration,
 };
@@ -427,10 +427,28 @@ fn main() -> ExitCode {
     // written, so a call that spelled it in shep-client would report
     // shep-client's version as this dog's.
     //
+    // The verb is how shep describes this dog: `shep --help` lists it with the
+    // description, and `shep log-rotate --help` is drawn from it rather than
+    // passed to this binary. A dog that declares none gets a stub page naming
+    // its version and nothing else.
+    //
+    // An example is spelled the way shep prints it, `shep` included, because
+    // shep writes `$ ` in front of the line and adds nothing else to it.
+    // `--print-config` is the only flag this dog takes, so it is the only
+    // example it has.
+    //
+    // The description is what an operator reads, so it stays inside the 60
+    // columns shep's listing has room for: `shep adopt` warns past that and
+    // adopts anyway, which is a line nobody sees rather than a refusal.
+    //
     // The permissions are the two requests a tick makes that a dog may not
     // always make: the flock listing and the reopen. Its own section is a
     // read every dog is allowed.
     Probe::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+        .verb(
+            Verb::new("Rotate each sheep's logs as they grow")
+                .with_examples(["shep log-rotate --print-config"]),
+        )
         .permission(Permission::new(
             "flock.read",
             true,

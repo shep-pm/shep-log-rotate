@@ -32,7 +32,7 @@ integration = []
 # Published 2026-08-26, so the git and branch keys are gone and this resolves
 # from the registry. The lockfile is what proves which source was used.
 #
-# The floor is 0.24.0, the shep this dog is built against. It is
+# The floor is 0.24.1, the shep this dog is built against. It is
 # a raised floor rather than the oldest version that still compiles, and that
 # is a change in what a floor here is for.
 #
@@ -47,7 +47,7 @@ integration = []
 # Protocol is still what a version skew breaks first, and it is not what
 # binds here. A dog announces the `PROTOCOL_VERSION` of the shep-core it was
 # compiled against, and the shepherd refuses a handshake below its own
-# `MIN_SUPPORTED`. 0.24.0 announces 18 and accepts 8, so this dog is still
+# `MIN_SUPPORTED`. 0.24.1 announces 18 and accepts 8, so this dog is still
 # heard by a much older shepherd; what it asks for is not. Its section now
 # goes through `Request::DogConfigResolved`, and a shepherd too old to know
 # that request is answered by the client's own fallback to the plain one, so
@@ -63,6 +63,11 @@ integration = []
 # The older floors, kept because each is still load-bearing and none is
 # visible in a version number:
 #
+# - 0.24.1 first had a manifest `verb` carrying `examples`, which is how this
+#   dog's help page gets its command line. `shep` draws a dog's `--help` from
+#   that field and prints `$ ` before each one, so a dog built below it can
+#   declare a description and subcommands but has no way to name an example,
+#   and `shep log-rotate --help` draws the page with no Examples section.
 # - 0.24.0 first had `#[shep(dog_wide)]`, which is how `interval` says it is
 #   set in `[log-rotate]` only, and `Probe::serves_every_sheep`, which is how
 #   a sheep with no table of its own still rotates on that section. Both are
@@ -108,7 +113,7 @@ integration = []
 #   `UpDuration`. Before it, a dog borrowing shep's grammars for its config
 #   type needed a second, direct shep-core dependency to turn that feature
 #   on. After it, `shep_client::shep_core` is the only path to these types.
-shep-client = "0.24.0"
+shep-client = "0.24.1"
 # `#[derive(JsonSchema)]` expands to absolute `schemars::` paths, so the
 # crate has to be nameable here even though shep-client already carries it.
 # Same version floor shep itself pins, so this adds an edge and not a crate.
@@ -131,7 +136,7 @@ tempfile = "3"
 # replaced. The feature gates shep-client's own `testing` module, which binds a
 # fake shepherd this crate can connect to. Nothing in the shipped binary sees
 # it.
-shep-client = { version = "0.24.0", features = ["test-support"] }
+shep-client = { version = "0.24.1", features = ["test-support"] }
 
 [[test]]
 name = "integration"
