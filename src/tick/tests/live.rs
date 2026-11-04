@@ -11,6 +11,7 @@ use super::*;
 use shep_client::{
     dogs::{DogIdentity, DogRuntime},
     shep_core::{
+        config::DogTable,
         paths::ShepPaths,
         protocol::{RpcError, RpcErrorCode},
     },
@@ -159,4 +160,111 @@ async fn a_shepherd_too_old_to_resolve_still_gets_the_plain_ask() {
         "nothing fell back to the plain request: {:?}",
         asked(&handovers)
     );
+}
+
+/// `max_size` as a table the shepherd serves for `web`.
+fn web_table(max_size: &str) -> BTreeMap<String, DogTable> {
+    let table = serde_json::json!({ "max_size": max_size });
+    BTreeMap::from([(
+        "web".to_owned(),
+        DogTable::from(table.as_object().cloned().expect("an object")),
+    )])
+}
+
+#[tokio::test]
+async fn each_tick_asks_the_shepherd_for_the_sheeps_tables_and_applies_them() {
+    // Read every tick and never kept, like the section: a `shep set` on one
+    // sheep lands on the next tick. The tables come from the dog's own name,
+    // which is the one request about every sheep a dog may make unasked.
+    //
+    // The table changes between the two ticks. A dog that kept the first
+    // answer would rotate on the second tick as well, so that is the
+    // difference the test can see.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = control_address(dir.path());
+    let handovers = fake_daemon_across_handovers(&socket, vec![Handshake::Accept(sample_ack())]);
+    handovers.reply_to_dog_config("max_size = \"1M\"\n");
+    let out = dir.path().join("web-0-out.log");
+    fs::write(&out, "x".repeat(2048)).expect("seeded");
+    handovers.reply_to_list(vec![sheep("web", Some(&out), None)]);
+    handovers.reply_to_dog_sheep_settings(web_table("1K"));
+
+    let live = session(dir.path(), &socket, "weathervane").await;
+    let (_config, first) = tick(&live, "weathervane", SystemTime::now(), &mut Stop::never())
+        .await
+        .expect("ticked");
+    assert_eq!(first.rotated, 1);
+    assert!(!out.exists(), "web's own 1K applied to its 2K log");
+
+    // `shep set web.dogs.weathervane.max_size 1M`, and a log over the old
+    // limit again.
+    handovers.reply_to_dog_sheep_settings(web_table("1M"));
+    fs::write(&out, "x".repeat(2048)).expect("grown again");
+    let (_config, second) = tick(&live, "weathervane", SystemTime::now(), &mut Stop::never())
+        .await
+        .expect("ticked");
+    assert_eq!(second.rotated, 0, "the second tick follows the new table");
+    assert!(out.exists(), "a 2K log is under web's new 1M");
+
+    let asked = asked(&handovers);
+    let tables: Vec<&Request> = asked
+        .iter()
+        .filter(|body| matches!(body, Request::DogSheepSettings { .. }))
+        .collect();
+    assert_eq!(tables.len(), 2, "once per tick: {asked:?}");
+    for body in tables {
+        match body {
+            Request::DogSheepSettings { dog } => assert_eq!(dog, "weathervane"),
+            other => unreachable!("{other:?} is not the request under test"),
+        }
+    }
+}
+
+/// A refusal the shepherd gives, as the client hands it over.
+fn refused(code: RpcErrorCode) -> Result<Response, RequestError> {
+    Err(RequestError::Rpc(RpcError {
+        code,
+        message: "refused".to_owned(),
+        daemon_version: None,
+    }))
+}
+
+#[test]
+fn a_shepherd_that_predates_the_sheep_tables_means_no_tables() {
+    // `Unsupported` is what a shepherd built before `DogSheepSettings` says to
+    // a request it has no verb for, and `Unrecognized` is a code this build
+    // was not taught. Neither is a fault: nothing there can hold a table, so
+    // every sheep rotates on the section. No seam drives this over the fake
+    // shepherd, which cannot refuse that request, so the decision is pinned
+    // where it is made.
+    for code in [RpcErrorCode::Unsupported, RpcErrorCode::Unrecognized] {
+        let tables = tables_from(refused(code)).expect("an old shepherd is not an error");
+        assert!(tables.is_empty(), "{code:?}");
+    }
+}
+
+#[test]
+fn any_other_refusal_of_the_sheep_tables_still_stops_the_tick() {
+    for code in [
+        RpcErrorCode::Forbidden,
+        RpcErrorCode::Internal,
+        RpcErrorCode::DeadlineExceeded,
+    ] {
+        let err = tables_from(refused(code)).expect_err("a real fault is not swallowed");
+        assert!(matches!(err, Error::Shepherd(_)), "{code:?}: {err}");
+    }
+    let err = tables_from(Err(RequestError::Closed)).expect_err("a dropped link stops it");
+    assert!(matches!(err, Error::Shepherd(_)), "{err}");
+}
+
+#[test]
+fn the_tables_a_shepherd_answers_are_the_tables_used() {
+    let tables = BTreeMap::from([("web".to_owned(), DogTable::from(serde_json::Map::new()))]);
+    let got = tables_from(Ok(Response::DogSheepSettings {
+        tables: tables.clone(),
+    }))
+    .expect("answered");
+    assert_eq!(got, tables);
+    let err = tables_from(Ok(Response::Pong)).expect_err("a different answer is refused");
+    assert!(matches!(err, Error::Protocol(_)), "{err}");
 }

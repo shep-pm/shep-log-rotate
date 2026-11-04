@@ -14,12 +14,16 @@
 //! which the daemon refuses to boot on rather than guess between.
 
 use core::fmt;
+use std::{collections::BTreeSet, sync::OnceLock};
 
 use schemars::JsonSchema;
 use serde::Deserialize;
 use shep_client::{
-    dogs::dog_config,
-    shep_core::values::{MemSize, ParseMemSizeError, ParseUpDurationError, UpDuration},
+    dogs::{DOG_WIDE_KEY, config_schema, dog_config},
+    shep_core::{
+        config::DogTable,
+        values::{MemSize, ParseMemSizeError, ParseUpDurationError, UpDuration},
+    },
 };
 
 /// How rotated generations are named. See the README for the trade-off.
@@ -114,6 +118,24 @@ pub enum ConfigError {
     /// `interval = 0`, which would ask the shepherd again the moment an
     /// answer came back.
     Interval,
+    /// A sheep's own table set a key that is dog-wide, so it belongs in the
+    /// dog's section.
+    DogWide(Vec<String>),
+    /// A key in a sheep's own table, or the section under it, that this dog
+    /// cannot read: one it has never had, or a value of the wrong type.
+    ///
+    /// Names the key and never the value. A sheep's table is not this dog's
+    /// to quote, and the parser's own message quotes the value.
+    Key(String),
+    /// A value in a sheep's own table that is not spelled the way shep spells
+    /// it: a size, a duration or a naming scheme this dog cannot use.
+    ///
+    /// Names the key and never the value, for the same reason as
+    /// [`Self::Key`]: the line it ends up on is a log line, and a sheep's
+    /// table is not this dog's to quote. [`Self::Size`], [`Self::Duration`]
+    /// and [`Self::Naming`] quote theirs, which is right for the dog's own
+    /// section that the operator wrote and is reading the complaint about.
+    Value(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -148,6 +170,19 @@ impl fmt::Display for ConfigError {
                 f,
                 "interval = 0 would ask the shepherd without pause; interval must be above 0"
             ),
+            Self::DogWide(keys) => write!(
+                f,
+                "{} is dog-wide: set it in the dog's own section of dogs.toml, not in a sheep's table",
+                keys.join(", ")
+            ),
+            Self::Key(key) => write!(
+                f,
+                "{key} is not a setting this dog can read: an unknown key, or a value of the wrong type"
+            ),
+            Self::Value(key) => write!(
+                f,
+                "{key} is not spelled the way shep spells it: see the README for the spellings"
+            ),
         }
     }
 }
@@ -157,7 +192,13 @@ impl core::error::Error for ConfigError {
         match self {
             Self::Size { source, .. } => Some(source),
             Self::Duration { source, .. } => Some(source),
-            Self::Toml(_) | Self::Naming(_) | Self::Keep | Self::Interval => None,
+            Self::Toml(_)
+            | Self::Naming(_)
+            | Self::Keep
+            | Self::Interval
+            | Self::DogWide(_)
+            | Self::Key(_)
+            | Self::Value(_) => None,
         }
     }
 }
@@ -243,9 +284,52 @@ pub struct Section {
     naming: Option<String>,
     /// gzip rotated generations. The newest is left plain so it stays greppable.
     compress: Option<bool>,
-    /// How often to look for a log worth rotating.
+    /// How often to look for a log worth rotating. One setting for the whole
+    /// flock: a sheep's own table cannot set it.
+    #[shep(dog_wide)]
     #[schemars(with = "Option<UpDuration>")]
     interval: Option<String>,
+}
+
+/// `err` with the value it quotes taken out, for an error that came off a
+/// sheep's own table.
+///
+/// `from_section` is shared with the dog's own section, where quoting the
+/// value is right: the operator wrote it and is reading the complaint. A
+/// sheep's value ends up in a log line and may be a secret reference, so the
+/// three variants that carry one become [`ConfigError::Value`], which names
+/// the key alone. The others carry no value of the operator's.
+fn withhold_value(err: ConfigError) -> ConfigError {
+    match err {
+        ConfigError::Size { field, .. } | ConfigError::Duration { field, .. } => {
+            ConfigError::Value(field.to_owned())
+        }
+        ConfigError::Naming(_) => ConfigError::Value("naming".to_owned()),
+        other => other,
+    }
+}
+
+/// The keys of [`Section`] the schema marks `#[shep(dog_wide)]`.
+///
+/// Read off the schema this dog publishes rather than listed a second time,
+/// so the keys a sheep's table is refused and the keys the schema tells the
+/// shepherd about cannot drift apart.
+fn dog_wide_keys() -> &'static BTreeSet<String> {
+    static KEYS: OnceLock<BTreeSet<String>> = OnceLock::new();
+    KEYS.get_or_init(|| {
+        let schema = config_schema::<Section>();
+        schema
+            .as_value()
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .into_iter()
+            .flatten()
+            .filter(|(_, property)| {
+                property.get(DOG_WIDE_KEY) == Some(&serde_json::Value::Bool(true))
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
+    })
 }
 
 /// Parse `value` into a [`MemSize`], naming `field` in the error.
@@ -289,6 +373,74 @@ impl Config {
     pub fn from_toml(text: &str) -> Result<Self, ConfigError> {
         let raw: Section =
             toml::from_str(text).map_err(|err| ConfigError::Toml(err.to_string()))?;
+        Self::from_section(raw)
+    }
+
+    /// The `[<name>]` section's text as the table a sheep's own table is
+    /// layered over.
+    ///
+    /// # Errors
+    /// [`ConfigError::Toml`] - the text is not valid TOML.
+    pub fn section_table(text: &str) -> Result<DogTable, ConfigError> {
+        toml::from_str::<serde_json::Map<String, serde_json::Value>>(text)
+            .map(DogTable::from)
+            .map_err(|err| ConfigError::Toml(err.to_string()))
+    }
+
+    /// The settings one sheep rotates on: `section` without its dog-wide keys,
+    /// then the sheep's `own` table over it. Every key `own` leaves unset is
+    /// the section's, and `interval` is always `self`'s: there is one loop.
+    ///
+    /// `self` is the whole section read once, and `section` the same text as
+    /// a table, which is what a layer can be laid over.
+    ///
+    /// # Errors
+    /// - [`ConfigError::DogWide`] - `own` sets a key only the section may.
+    /// - [`ConfigError::Key`] - a key of the layered table is one this dog
+    ///   cannot read.
+    /// - [`ConfigError::Value`] - a value is not spelled the way shep spells
+    ///   it. The key is named and the value is not.
+    /// - [`ConfigError::Keep`] - `keep = 0`.
+    pub fn for_sheep(&self, section: &DogTable, own: &DogTable) -> Result<Self, ConfigError> {
+        let dog_wide = dog_wide_keys();
+        let set_here: Vec<String> = own
+            .as_map()
+            .keys()
+            .filter(|key| dog_wide.contains(*key))
+            .cloned()
+            .collect();
+        if !set_here.is_empty() {
+            return Err(ConfigError::DogWide(set_here));
+        }
+        let mut shared = section.as_map().clone();
+        shared.retain(|key, _| !dog_wide.contains(key));
+        let merged = DogTable::layered(&[&DogTable::from(shared), own]).into_map();
+        let raw = serde_json::from_value::<Section>(serde_json::Value::Object(merged.clone()))
+            .map_err(|_| {
+                // The parser's message quotes the value, and a sheep's table
+                // is not this dog's to quote. A key read on its own names
+                // the fault without it.
+                let key = merged
+                    .iter()
+                    .find(|(key, value)| {
+                        let one = serde_json::Map::from_iter([((*key).clone(), (*value).clone())]);
+                        serde_json::from_value::<Section>(serde_json::Value::Object(one)).is_err()
+                    })
+                    .map_or_else(String::new, |(key, _)| key.clone());
+                ConfigError::Key(key)
+            })?;
+        Ok(Self {
+            interval: self.interval,
+            ..Self::from_section(raw).map_err(withhold_value)?
+        })
+    }
+
+    /// The settings a parsed [`Section`] stands for, each unset key at its
+    /// default.
+    ///
+    /// # Errors
+    /// As [`Self::from_toml`], past parsing the text.
+    pub fn from_section(raw: Section) -> Result<Self, ConfigError> {
         let defaults = Self::default();
         let interval = raw
             .interval
@@ -480,6 +632,85 @@ interval = "5s"
                 ..Config::default()
             }
         );
+    }
+
+    /// `own` as the table a sheep carries, laid over `section_text`.
+    fn for_sheep(section_text: &str, own: &str) -> Result<Config, ConfigError> {
+        let base = Config::from_toml(section_text).expect("a valid section");
+        let section = Config::section_table(section_text).expect("TOML");
+        let own = Config::section_table(own).expect("TOML");
+        base.for_sheep(&section, &own)
+    }
+
+    #[test]
+    fn a_sheeps_table_is_laid_over_the_section_key_by_key() {
+        let config = for_sheep(
+            "max_size = \"1K\"\nkeep = 7\ninterval = \"5s\"\n",
+            "keep = 2\n",
+        )
+        .expect("valid");
+        assert_eq!(config.keep, 2);
+        assert_eq!(config.max_size.bytes(), 1024);
+        assert_eq!(
+            config.interval.as_duration().as_secs(),
+            5,
+            "the one loop's interval"
+        );
+    }
+
+    #[test]
+    fn a_sheeps_table_cannot_set_what_is_dog_wide() {
+        let err = for_sheep("", "interval = \"1s\"\nkeep = 2\n").expect_err("refused");
+        let shown = err.to_string();
+        assert!(shown.contains("interval"), "{shown}");
+        assert!(!shown.contains("keep"), "only the offending key: {shown}");
+        assert_no_dashes(&shown);
+    }
+
+    #[test]
+    fn a_key_a_sheep_cannot_use_is_named_and_its_value_is_not() {
+        for own in ["keep = \"hunter2\"\n", "hunter2 = 1\n"] {
+            let err = for_sheep("", own).expect_err("refused");
+            let shown = err.to_string();
+            assert!(
+                shown.starts_with("keep ") || shown.starts_with("hunter2 "),
+                "{shown}"
+            );
+            assert!(
+                !shown.contains("\"hunter2\""),
+                "a sheep's value is not quoted: {shown}"
+            );
+            assert_no_dashes(&shown);
+        }
+    }
+
+    #[test]
+    fn a_value_a_sheep_spells_wrongly_is_not_quoted_either() {
+        // `from_toml` quotes the value, and rightly: it is the operator's own
+        // section. A sheep's table reaches a log line, so its keys are named
+        // and its values are not, whichever grammar they failed.
+        for (own, key) in [
+            ("max_size = \"hunter2\"\n", "max_size"),
+            ("max_age = \"hunter2\"\n", "max_age"),
+            ("naming = \"hunter2\"\n", "naming"),
+        ] {
+            let err = for_sheep("", own).expect_err("refused");
+            let shown = err.to_string();
+            assert!(shown.starts_with(key), "{shown}");
+            assert!(!shown.contains("hunter2"), "{shown}");
+            assert_no_dashes(&shown);
+        }
+        let section = Config::from_toml("max_size = \"hunter2\"\n").expect_err("refused");
+        assert!(
+            section.to_string().contains("hunter2"),
+            "the section's own complaint still quotes it"
+        );
+    }
+
+    #[test]
+    fn the_dog_wide_keys_are_the_ones_the_schema_marks() {
+        let keys: Vec<&str> = dog_wide_keys().iter().map(String::as_str).collect();
+        assert_eq!(keys, ["interval"]);
     }
 
     #[test]

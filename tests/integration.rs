@@ -801,3 +801,93 @@ fn a_generation_name_reached_through_a_symlinked_directory_is_left_alone() {
         "alpha rotated despite the collision"
     );
 }
+
+#[test]
+fn a_sheeps_own_table_sets_its_rotation_while_another_follows_the_section() {
+    // The section rotates nothing under 8M, and both sheep write about a
+    // megabyte and a half, each line stamped by shep. Only the sheep whose own table lowers `max_size`
+    // can therefore rotate, and it does so after the dog is already running,
+    // which also proves the table is read on a later tick rather than once at
+    // startup.
+    let shepherd = Shepherd::new();
+    let tuned_done = shepherd.home().join("tuned-finished");
+    let plain_done = shepherd.home().join("plain-finished");
+    let tuned_script = write_script(
+        shepherd.home(),
+        "tuned.sh",
+        &format!(
+            "#!/bin/sh\ni=0\nwhile [ \"$i\" -lt 40000 ]; do echo \"$i\"; i=$((i+1)); done\n\
+             : > {}\nsleep 300\n",
+            tuned_done.display()
+        ),
+    );
+    let plain_script = write_script(
+        shepherd.home(),
+        "plain.sh",
+        &format!(
+            "#!/bin/sh\ni=0\nwhile [ \"$i\" -lt 40000 ]; do echo \"$i\"; i=$((i+1)); done\n\
+             : > {}\nsleep 300\n",
+            plain_done.display()
+        ),
+    );
+    shepherd.write_config(
+        "[weathervane]\n\
+         max_size = \"8M\"\n\
+         keep = 5000\n\
+         compress = false\n\
+         interval = \"50\"\n\
+         naming = \"numeric\"\n",
+    );
+
+    shepherd.ok(&[
+        "adopt",
+        DOG_BIN,
+        "--name",
+        "weathervane",
+        "--yes",
+        "--style",
+        "bare",
+    ]);
+    for (name, script) in [("tuned", &tuned_script), ("plain", &plain_script)] {
+        shepherd.ok(&[
+            "start",
+            script.to_str().expect("script path"),
+            "--name",
+            name,
+            "--style",
+            "bare",
+        ]);
+    }
+    wait_until("both sheep to finish writing", || {
+        tuned_done.exists() && plain_done.exists()
+    });
+    shepherd.ok(&[
+        "set",
+        "tuned.dogs.weathervane.max_size",
+        "8K",
+        "--yes",
+        "--style",
+        "bare",
+    ]);
+
+    wait_until(
+        "the dog to rotate the sheep whose table lowers max_size",
+        || {
+            generations_oldest_first(&shepherd.logs(), "tuned-0-out", true)
+                .iter()
+                .filter(|path| path.exists())
+                .count()
+                > 1
+        },
+    );
+    // The same ticks that rotated `tuned` looked at `plain` too.
+    let plain: Vec<PathBuf> = generations_oldest_first(&shepherd.logs(), "plain-0-out", true)
+        .into_iter()
+        .filter(|path| path.exists())
+        .collect();
+    assert_eq!(
+        plain.len(),
+        1,
+        "a sheep with no table of its own follows the section's 8M: {plain:?}"
+    );
+}

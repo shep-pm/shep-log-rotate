@@ -1,5 +1,6 @@
-//! One poll of the rotator's loop: read the config, list the flock, rename
-//! what has grown, ask the shepherd to reopen, then compress and prune.
+//! One poll of the rotator's loop: read the config and each sheep's own
+//! table, list the flock, rename what has grown, ask the shepherd to reopen,
+//! then compress and prune.
 //!
 //! This is the only module that speaks to the daemon, and it is where the
 //! two guards no earlier module could enforce live.
@@ -40,7 +41,7 @@
 
 use core::{fmt, time::Duration};
 use std::{
-    collections::{BTreeMap, btree_map::Entry},
+    collections::{BTreeMap, BTreeSet, btree_map::Entry},
     fs,
     path::Path,
     sync::Arc,
@@ -48,9 +49,12 @@ use std::{
 };
 
 use shep_client::{
-    LinkState,
+    LinkState, RequestError,
     dogs::DogRuntime,
-    shep_core::protocol::{ProcessInfo, Request, Response, SelectorSpec},
+    shep_core::{
+        config::DogTable,
+        protocol::{ProcessInfo, Request, Response, RpcErrorCode, SelectorSpec},
+    },
 };
 
 use crate::{
@@ -88,6 +92,13 @@ pub trait Daemon {
     /// [`Error::Protocol`] if it answers with something other than a dog
     /// section.
     async fn dog_config(&self, name: &str) -> Result<String, Error>;
+
+    /// Each sheep's own `[app.dogs.<name>]` table, by sheep name. A sheep
+    /// with no such table is absent.
+    ///
+    /// # Errors
+    /// As [`Self::dog_config`].
+    async fn sheep_tables(&self, name: &str) -> Result<BTreeMap<String, DogTable>, Error>;
 
     /// Every supervised entry, dogs included.
     ///
@@ -170,6 +181,12 @@ pub struct Report {
     /// same directory and says so too. Anything here wants a human: it is a
     /// permissions problem.
     pub unlistable: Vec<String>,
+    /// Sheep left alone this tick because their own `[app.dogs.<name>]`
+    /// table could not be used, one message each naming the sheep and the
+    /// key. Their logs are neither rotated nor tidied, and a log they share
+    /// with another sheep is left alone for it too. The fault recurs next
+    /// tick until somebody edits the table.
+    pub left_alone: Vec<String>,
 }
 
 impl Report {
@@ -189,6 +206,7 @@ impl Report {
             && self.rename_failed.is_empty()
             && self.tidy_failed.is_empty()
             && self.unlistable.is_empty()
+            && self.left_alone.is_empty()
         {
             return None;
         }
@@ -210,6 +228,9 @@ impl Report {
         }
         if let Some(why) = &self.reopen_failed {
             line.push_str(&format!(", stopped early: reopen refused ({why})"));
+        }
+        for why in &self.left_alone {
+            line.push_str(&format!(", left {why}"));
         }
         for (what, faults) in [
             ("rename", &self.rename_failed),
@@ -244,11 +265,15 @@ fn times(n: usize) -> String {
 ///
 /// The order is load-bearing:
 ///
-/// 1. Read the config. Never cached: the daemon re-reads its side per
-///    request, and a dog that cached this would undo that, so changing
-///    `max_size` would need a `shep disable` and a `shep enable` rather than
-///    taking effect on the next tick.
-/// 2. List the flock, and build the protected set from all of it.
+/// 1. Read the config, and every sheep's own table over it. Never cached:
+///    the daemon re-reads its side per request, and a dog that cached this
+///    would undo that, so changing `max_size` would need a `shep disable` and
+///    a `shep enable` rather than taking effect on the next tick. A sheep
+///    whose table does not parse is left alone this tick, and so is every log
+///    it shares with another sheep, because the sheep that does not parse
+///    would never be reopened after a rename.
+/// 2. List the flock, and build the protected set from all of it, left-alone
+///    sheep included.
 /// 3. Stat and qualify every log path, before renaming any of them, so that
 ///    two sheep sharing one path both see it as it was.
 /// 4. Per sheep: rename its qualifying files, then reopen that sheep alone.
@@ -278,9 +303,10 @@ fn times(n: usize) -> String {
 /// # Errors
 /// - [`Error::Config`] if the `[<name>]` section cannot be understood.
 ///   Nothing is touched in that case; the tick reads the config first for
-///   exactly that reason.
-/// - [`Error::Shepherd`] or [`Error::Protocol`] if the config or the flock
-///   listing cannot be had. A refused *reopen* is not an error: it is
+///   exactly that reason. A sheep's own table that cannot be understood is
+///   not this error: it is reported in [`Report::left_alone`].
+/// - [`Error::Shepherd`] or [`Error::Protocol`] if the config, the sheep's
+///   tables or the flock listing cannot be had. A refused *reopen* is not an error: it is
 ///   reported in [`Report::reopen_failed`], because shep is still writing into
 ///   the renamed file through its existing descriptor, so nothing is lost and
 ///   the next successful reopen recovers.
@@ -309,18 +335,35 @@ pub async fn tick<D: Daemon>(
     // section is `[<name>]` for whatever this dog was adopted as, and an
     // error naming some other block sends the reader to a section they never
     // wrote.
-    let config =
-        Config::from_toml(&daemon.dog_config(dog_name).await?).map_err(|source| Error::Config {
-            section: dog_name.to_owned(),
-            source,
-        })?;
+    let in_section = |source| Error::Config {
+        section: dog_name.to_owned(),
+        source,
+    };
+    let text = daemon.dog_config(dog_name).await?;
+    let config = Config::from_toml(&text).map_err(in_section)?;
+    let section = Config::section_table(&text).map_err(in_section)?;
+    let tables = daemon.sheep_tables(dog_name).await?;
     let flock = daemon.list_flock().await?;
+    let mut report = Report::default();
+    let Rules {
+        settings,
+        left_alone,
+    } = sheep_rules(&config, &section, &tables, &flock, &mut report);
     // Every live log path the flock reported, in one set, because the
     // collision it exists to catch is between different sheep.
     let protected = Arc::new(FileSet::from_paths(
         flock.iter().flat_map(log_paths).map(Path::new),
     ));
-    let mut report = Report::default();
+    // Every path a sheep left alone writes to. Another sheep sharing one would
+    // rename it out from under a sheep that is never reopened, so the file is
+    // left alone for everyone.
+    let held = FileSet::from_paths(
+        flock
+            .iter()
+            .filter(|sheep| left_alone.contains(&sheep.name))
+            .flat_map(log_paths)
+            .map(Path::new),
+    );
 
     // Qualify the whole flock before renaming anything. Two sheep can share
     // one log path (`merge_logs`, or an explicit `out_file` on a
@@ -339,6 +382,9 @@ pub async fn tick<D: Daemon>(
     // second one renamed. That race has no seam a test can drive, so the
     // one stat per file is what pins it.
     let mut verdicts: BTreeMap<(ResolvedDir, String), Verdict> = BTreeMap::new();
+    // The rules of every sheep that writes to each file, so that the one
+    // verdict is judged against all of them and not just the first sheep's.
+    let owners = owners_of(&flock, &settings, &config, &protected);
     for sheep in &flock {
         for path in log_paths(sheep) {
             // A path this dog cannot spell is a path it must not go on to
@@ -350,6 +396,9 @@ pub async fn tick<D: Daemon>(
                 continue;
             };
             let file = (protected.resolve(&base.dir), base.live_name());
+            if held.contains(&file.0, &file.1) {
+                continue;
+            }
             let verdict = match verdicts.get(&file) {
                 Some(verdict) => *verdict,
                 None => {
@@ -358,17 +407,16 @@ pub async fn tick<D: Daemon>(
                         // file yet, and that is normal rather than broken.
                         Err(_) => Verdict::Skip,
                         Ok(metadata) => {
-                            match qualifies(&base, &file.0, &metadata, &config, now, &mut listings)
-                            {
-                                // One directory this dog cannot read is
-                                // that log's problem, said so, and not a
-                                // reason to leave every other log alone.
-                                Listed::Unlistable(why) => {
-                                    report.unlistable.push(why);
-                                    Verdict::Leave
-                                }
-                                Listed::Verdict(verdict) => verdict,
-                            }
+                            let rules = owners.get(&file).map_or(&[][..], Vec::as_slice);
+                            judge(
+                                &base,
+                                &file.0,
+                                &metadata,
+                                rules,
+                                now,
+                                &mut listings,
+                                &mut report,
+                            )
                         }
                     };
                     verdicts.insert(file, verdict);
@@ -406,7 +454,7 @@ pub async fn tick<D: Daemon>(
     let mut renamed = FileSet::default();
     // Bases whose sheep has reopened, so shep has stopped writing into what
     // was renamed. Only those are safe to compress or delete.
-    let mut to_tidy: Vec<LogPath> = Vec::new();
+    let mut to_tidy: Vec<(LogPath, Config)> = Vec::new();
     // Files some sheep failed to rename this tick. A later sheep sharing
     // the file can succeed where that one failed, and the first sheep,
     // reopened before the file moved or never reopened at all, then writes
@@ -433,8 +481,9 @@ pub async fn tick<D: Daemon>(
         // reopen it, so it still gets the reopen it needs. That costs one
         // request and starts no rename.
         let stopping = stop.requested();
+        let rules = settings.get(name).unwrap_or(&config);
         let mut rotated_any = false;
-        let mut rotated_here: Vec<LogPath> = Vec::new();
+        let mut rotated_here: Vec<(LogPath, Config)> = Vec::new();
         for base in &groups[name] {
             // Through `protected` rather than `ResolvedDir::of`, so this
             // base is resolved the way the protected set was, at the moment
@@ -451,14 +500,28 @@ pub async fn tick<D: Daemon>(
             if stopping {
                 continue;
             }
-            if collides_with_a_live_log(base, &dir, config.naming, &protected) {
+            if collides_with_a_live_log(base, &dir, rules.naming, &protected) {
                 report.skipped_collision += 1;
                 continue;
             }
-            match rotate(base, config.naming, now) {
+            match rotate(base, rules.naming, now) {
                 Ok(_generation) => {
+                    // The generations are pruned to the most any owner of
+                    // the file asked to keep, so no sheep sharing it loses
+                    // history it asked for. The renaming sheep's own rules
+                    // otherwise stand: it names and compresses.
+                    let keep = owners
+                        .get(&(dir.clone(), live_name.clone()))
+                        .and_then(|owned| owned.iter().map(|owner| owner.keep).max())
+                        .unwrap_or(rules.keep);
+                    rotated_here.push((
+                        base.clone(),
+                        Config {
+                            keep,
+                            ..rules.clone()
+                        },
+                    ));
                     renamed.insert(dir, live_name);
-                    rotated_here.push(base.clone());
                     report.rotated += 1;
                     rotated_any = true;
                 }
@@ -499,11 +562,55 @@ pub async fn tick<D: Daemon>(
             still_writing.insert(protected.resolve(&base.dir), base.live_name());
         }
     }
-    to_tidy
-        .retain(|base| !still_writing.contains(&protected.resolve(&base.dir), &base.live_name()));
+    to_tidy.retain(|(base, _)| {
+        !still_writing.contains(&protected.resolve(&base.dir), &base.live_name())
+    });
 
-    tidy_all(&to_tidy, &config, &protected, &mut report, stop).await;
+    tidy_all(&to_tidy, &protected, &mut report, stop).await;
     Ok((config, report))
+}
+
+/// What [`sheep_rules`] settled for the flock.
+struct Rules {
+    /// The settings of each sheep whose own table parsed, by sheep name. A
+    /// sheep with no table is absent, and rotates on the section's.
+    settings: BTreeMap<String, Config>,
+    /// The sheep whose own table did not parse.
+    left_alone: BTreeSet<String>,
+}
+
+/// Lay each sheep's own table over `section`, once per tick.
+///
+/// A table that does not parse leaves that sheep alone this tick and says
+/// so in `report`. It is that sheep's problem, so the others still rotate. A
+/// table on a name the flock does not hold is ignored: there is nothing it
+/// could rotate, and nothing it could leave alone.
+fn sheep_rules(
+    config: &Config,
+    section: &DogTable,
+    tables: &BTreeMap<String, DogTable>,
+    flock: &[ProcessInfo],
+    report: &mut Report,
+) -> Rules {
+    let mut rules = Rules {
+        settings: BTreeMap::new(),
+        left_alone: BTreeSet::new(),
+    };
+    for (name, own) in tables {
+        if !flock.iter().any(|sheep| sheep.name == *name) {
+            continue;
+        }
+        match config.for_sheep(section, own) {
+            Ok(settings) => {
+                rules.settings.insert(name.clone(), settings);
+            }
+            Err(why) => {
+                report.left_alone.push(format!("{name} alone ({why})"));
+                rules.left_alone.insert(name.clone());
+            }
+        }
+    }
+    rules
 }
 
 /// Compress and prune each of `bases`, adding what happened to `report`.
@@ -528,13 +635,12 @@ pub async fn tick<D: Daemon>(
 /// listed; the next generation and the next base are still tidied. The
 /// fault is that generation's, and the generation is left as it was.
 async fn tidy_all(
-    bases: &[LogPath],
-    config: &Config,
+    bases: &[(LogPath, Config)],
     protected: &Arc<FileSet>,
     report: &mut Report,
     stop: &mut Stop,
 ) {
-    for base in bases {
+    for (base, config) in bases {
         if stop.requested() {
             return;
         }
@@ -590,6 +696,68 @@ enum Verdict {
 enum Listed {
     Verdict(Verdict),
     Unlistable(String),
+}
+
+/// The rules of every sheep that writes to each log file, keyed the way the
+/// tick keys a file: the directory as `protected` resolves it, and the live
+/// name.
+///
+/// A sheep with no table of its own is an owner on the section's rules. A
+/// sheep left alone is one too, on those same rules, but its files are held
+/// and never reach a verdict, so what it says here is not read.
+fn owners_of<'a>(
+    flock: &[ProcessInfo],
+    settings: &'a BTreeMap<String, Config>,
+    config: &'a Config,
+    protected: &FileSet,
+) -> BTreeMap<(ResolvedDir, String), Vec<&'a Config>> {
+    let mut owners: BTreeMap<(ResolvedDir, String), Vec<&Config>> = BTreeMap::new();
+    for sheep in flock {
+        let rules = settings.get(&sheep.name).unwrap_or(config);
+        for path in log_paths(sheep) {
+            if let Some(base) = LogPath::split(Path::new(path)) {
+                owners
+                    .entry((protected.resolve(&base.dir), base.live_name()))
+                    .or_default()
+                    .push(rules);
+            }
+        }
+    }
+    owners
+}
+
+/// The one verdict for a log, judged against the rules of every sheep that
+/// writes to it: the file rotates when any owner's rules say it should.
+///
+/// The first sheep in the flock's order used to decide alone, so a log's fate
+/// depended on where its owners happened to be listed, and a sheep that asked
+/// for a tighter `max_size` or `max_age` was ignored if another came first.
+/// One owner wanting a rotation is reason enough, since declining it would
+/// refuse that sheep what its own table asked for. Every owner is asked even
+/// once one has said yes, so that a directory too unreadable to age a log by
+/// is reported whichever order the flock lists its owners in. The file is
+/// still stat-ed once, by the caller, and each owner reads it through the same
+/// `metadata`.
+fn judge(
+    base: &LogPath,
+    dir: &ResolvedDir,
+    metadata: &fs::Metadata,
+    owners: &[&Config],
+    now: SystemTime,
+    listings: &mut BTreeMap<ResolvedDir, Option<Vec<String>>>,
+    report: &mut Report,
+) -> Verdict {
+    let mut verdict = Verdict::Leave;
+    for rules in owners {
+        match qualifies(base, dir, metadata, rules, now, listings) {
+            // One directory this dog cannot read is that log's problem, said
+            // so, and not a reason to leave every other log alone.
+            Listed::Unlistable(why) => report.unlistable.push(why),
+            Listed::Verdict(Verdict::Rotate) => verdict = Verdict::Rotate,
+            Listed::Verdict(_) => {}
+        }
+    }
+    verdict
 }
 
 /// Whether a log has grown or aged past what `config` allows.
@@ -777,6 +945,13 @@ impl Daemon for Live {
         Ok(self.0.client().dog_config(name).await?.as_str().to_owned())
     }
 
+    async fn sheep_tables(&self, name: &str) -> Result<BTreeMap<String, DogTable>, Error> {
+        let asked = Request::DogSheepSettings {
+            dog: name.to_owned(),
+        };
+        tables_from(self.0.client().request(asked).await)
+    }
+
     async fn list_flock(&self) -> Result<Vec<ProcessInfo>, Error> {
         match self.0.client().request(Request::ListFlock).await? {
             Response::Flock(flock) => Ok(flock),
@@ -792,6 +967,35 @@ impl Daemon for Live {
             Response::Reopened(_) => Ok(()),
             other => Err(unexpected("Reopen", &other)),
         }
+    }
+}
+
+/// The sheep tables an answer to `DogSheepSettings` stands for.
+///
+/// A shepherd that does not know the request refuses it with `Unsupported`,
+/// or with `Unrecognized` when the refusal's own code is one this build was
+/// not taught. Such a shepherd has no `[app.dogs.<name>]` table to serve, so
+/// no sheep has a rule of its own and every one rotates on the section, which
+/// is what no tables at all means. Failing the tick instead would leave this
+/// dog unable to rotate anything on a shepherd that runs perfectly well,
+/// the same reason the client's own `dog_config` falls back for a section.
+/// Any other refusal still stops the tick: a `Forbidden` or a dropped link is
+/// a fault the operator has to hear about, not a missing feature.
+fn tables_from(
+    answer: Result<Response, RequestError>,
+) -> Result<BTreeMap<String, DogTable>, Error> {
+    match answer {
+        Ok(Response::DogSheepSettings { tables }) => Ok(tables),
+        Ok(other) => Err(unexpected("DogSheepSettings", &other)),
+        Err(RequestError::Rpc(refusal))
+            if matches!(
+                refusal.code,
+                RpcErrorCode::Unsupported | RpcErrorCode::Unrecognized
+            ) =>
+        {
+            Ok(BTreeMap::new())
+        }
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -811,6 +1015,9 @@ fn named(response: &Response) -> String {
         Response::Pong => "Pong".to_owned(),
         Response::Flock(flock) => format!("a Flock of {}", flock.len()),
         Response::DogSection { .. } => "a DogSection".to_owned(),
+        Response::DogSheepSettings { tables } => {
+            format!("a DogSheepSettings of {}", tables.len())
+        }
         Response::Reopened(sheep) => format!("a Reopened of {}", sheep.len()),
         // `Response` is `#[non_exhaustive]`, so this arm is not optional. A
         // variant added to the protocol after this dog was written is
@@ -827,8 +1034,10 @@ mod tests {
     use shep_client::shep_core::status::ProcStatus;
     use std::cell::RefCell;
 
+    mod faults;
     mod live;
     mod reconnect;
+    mod sheep;
     mod stop;
     /// What a test runs on every reopen, handed the sheep's name.
     type Hook = Box<dyn Fn(&str)>;
@@ -836,6 +1045,8 @@ mod tests {
     /// A daemon that answers from a script and records what it was asked.
     struct Fake {
         config: String,
+        /// Each sheep's own table, as TOML text.
+        tables: Vec<(String, String)>,
         flock: Vec<ProcessInfo>,
         reopen_fails: Option<String>,
         reopened: RefCell<Vec<String>>,
@@ -845,10 +1056,17 @@ mod tests {
     }
 
     impl Fake {
+        /// This daemon, with `sheep` carrying `[app.dogs.<name>]` set to `table`.
+        fn with_table(mut self, sheep: &str, table: &str) -> Self {
+            self.tables.push((sheep.to_owned(), table.to_owned()));
+            self
+        }
+
         /// A daemon serving `config` and `flock` that grants every reopen.
         fn new(config: &str, flock: Vec<ProcessInfo>) -> Self {
             Self {
                 config: config.to_owned(),
+                tables: Vec::new(),
                 flock,
                 reopen_fails: None,
                 reopened: RefCell::new(Vec::new()),
@@ -860,6 +1078,17 @@ mod tests {
     impl Daemon for Fake {
         async fn dog_config(&self, _name: &str) -> Result<String, Error> {
             Ok(self.config.clone())
+        }
+        async fn sheep_tables(&self, _name: &str) -> Result<BTreeMap<String, DogTable>, Error> {
+            Ok(self
+                .tables
+                .iter()
+                .map(|(sheep, text)| {
+                    let table: serde_json::Map<String, serde_json::Value> =
+                        toml::from_str(text).expect("a table the test wrote is TOML");
+                    (sheep.clone(), DogTable::from(table))
+                })
+                .collect())
         }
         async fn list_flock(&self) -> Result<Vec<ProcessInfo>, Error> {
             Ok(self.flock.clone())
@@ -1500,251 +1729,5 @@ mod tests {
         let (_config, report) = run(&fake, SystemTime::now()).await.expect("ticked");
 
         assert_eq!(report.rotated, 0);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_log_directory_that_cannot_be_listed_is_skipped_and_said() {
-        // api's directory lost its read bit, so its age cannot be read off
-        // its generations. That is api's problem, reported as such, and not
-        // a reason to leave web unrotated.
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().expect("tempdir");
-        let apis = dir.path().join("api");
-        fs::create_dir(&apis).expect("created");
-        let api = apis.join("api-0-out.log");
-        let web = dir.path().join("web-0-out.log");
-        fs::write(&api, "small\n").expect("seeded");
-        fs::write(&web, "x".repeat(2048)).expect("seeded");
-        fs::set_permissions(&apis, fs::Permissions::from_mode(0o311)).expect("chmod");
-        if fs::read_dir(&apis).is_ok() {
-            // Root, or anything with CAP_DAC_OVERRIDE, is not refused by a
-            // mode bit, so the precondition this test is about is absent.
-            fs::set_permissions(&apis, fs::Permissions::from_mode(0o755)).expect("chmod back");
-            eprintln!("skipped: this process can list a directory without its read bit");
-            return;
-        }
-        let fake = Fake::new(
-            "max_size = \"1K\"\nmax_age = \"168h\"\n",
-            vec![
-                sheep("api", Some(&api), None),
-                sheep("web", Some(&web), None),
-            ],
-        );
-
-        let outcome = run(&fake, SystemTime::now()).await;
-        fs::set_permissions(&apis, fs::Permissions::from_mode(0o755)).expect("chmod back");
-        let (_config, report) = outcome.expect("one unlistable directory does not fail the tick");
-
-        assert_eq!(report.rotated, 1, "web rotated");
-        assert_eq!(report.unlistable.len(), 1, "{:?}", report.unlistable);
-        assert!(
-            report.unlistable[0].contains("api"),
-            "{:?}",
-            report.unlistable
-        );
-        let line = report.summary().expect("a line");
-        assert!(line.contains("to list a log directory"), "{line}");
-    }
-
-    #[tokio::test]
-    async fn a_rename_fault_on_one_sheep_does_not_stop_the_next() {
-        // api's directory has run out of generation numbers. That is api's
-        // problem, reported as such; web, in its own directory and over
-        // max_size, still rotates on the same tick.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let apis = dir.path().join("api");
-        fs::create_dir(&apis).expect("created");
-        let api = apis.join("api-0-out.log");
-        let web = dir.path().join("web-0-out.log");
-        fs::write(&api, "x".repeat(2048)).expect("seeded");
-        fs::write(&web, "x".repeat(2048)).expect("seeded");
-        fs::write(apis.join("api-0-out.log.4294967295"), "oldest").expect("seeded");
-        let fake = Fake::new(
-            "max_size = \"1K\"\nnaming = \"numeric\"\n",
-            vec![
-                sheep("api", Some(&api), None),
-                sheep("web", Some(&web), None),
-            ],
-        );
-
-        let (_config, report) = run(&fake, SystemTime::now()).await.expect("ticked");
-
-        assert_eq!(report.rename_failed.len(), 1, "{:?}", report.rename_failed);
-        assert_eq!(report.rotated, 1, "web rotated regardless");
-        assert_eq!(*fake.reopened.borrow(), vec!["web".to_owned()]);
-        assert!(api.exists(), "api's live log is where it was");
-    }
-
-    #[tokio::test]
-    async fn a_tidy_fault_is_reported_and_the_tick_goes_on() {
-        // The .gz that compressing the older generation would create is a
-        // directory, so File::create fails. That is that generation's
-        // problem, on the summary line; the rotation and the reopen stand,
-        // and the report comes back whole.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let out = dir.path().join("web-0-out.log");
-        fs::write(&out, "x".repeat(2048)).expect("seeded");
-        let older = dir.path().join("web-0-out.2026-08-20T15-04-01.log");
-        fs::write(&older, "older\n").expect("seeded");
-        fs::create_dir(dir.path().join("web-0-out.2026-08-20T15-04-01.log.gz")).expect("blocker");
-        let fake = Fake::new("max_size = \"1K\"\n", vec![sheep("web", Some(&out), None)]);
-
-        let (_config, report) = run(&fake, SystemTime::now())
-            .await
-            .expect("a tidy fault is reported, not returned");
-
-        assert_eq!(report.rotated, 1);
-        assert_eq!(*fake.reopened.borrow(), vec!["web".to_owned()]);
-        assert_eq!(report.tidy_failed.len(), 1, "{:?}", report.tidy_failed);
-        assert!(
-            report.tidy_failed[0].contains("15-04-01.log.gz"),
-            "{:?}",
-            report.tidy_failed
-        );
-        assert!(
-            older.exists(),
-            "the generation that could not be compressed is still plain"
-        );
-        let line = report.summary().expect("a line");
-        assert!(line.contains("to compress or delete"), "{line}");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn an_unlistable_directory_is_listed_once_and_reported_once() {
-        // merge_logs points out_file and err_file at one path, and a second
-        // sheep logs in the same directory. One directory, one attempt, one
-        // line on the summary.
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().expect("tempdir");
-        let apis = dir.path().join("api");
-        fs::create_dir(&apis).expect("created");
-        let api = apis.join("api-0-out.log");
-        let other = apis.join("api-1-out.log");
-        fs::write(&api, "small\n").expect("seeded");
-        fs::write(&other, "small\n").expect("seeded");
-        fs::set_permissions(&apis, fs::Permissions::from_mode(0o311)).expect("chmod");
-        if fs::read_dir(&apis).is_ok() {
-            fs::set_permissions(&apis, fs::Permissions::from_mode(0o755)).expect("chmod back");
-            eprintln!("skipped: this process can list a directory without its read bit");
-            return;
-        }
-        let fake = Fake::new(
-            "max_size = \"1K\"\nmax_age = \"168h\"\n",
-            vec![
-                sheep("api", Some(&api), Some(&api)),
-                sheep("api-1", Some(&other), None),
-            ],
-        );
-
-        let outcome = run(&fake, SystemTime::now()).await;
-        fs::set_permissions(&apis, fs::Permissions::from_mode(0o755)).expect("chmod back");
-        let (_config, report) = outcome.expect("ticked");
-
-        assert_eq!(report.unlistable.len(), 1, "{:?}", report.unlistable);
-        assert_eq!(report.rotated, 0);
-    }
-
-    #[tokio::test]
-    async fn a_file_one_sheep_failed_to_rename_is_held_back_when_another_renames_it() {
-        // alpha and gamma share `shared.log`. alpha's own log rotates, its
-        // rename of the shared log fails on a directory sitting where `.1`
-        // goes, and alpha is reopened for its own log. The reopen hook then
-        // clears the blocker, so gamma's rename of the shared log succeeds
-        // and gamma is reopened. alpha, reopened before the file moved,
-        // writes into the renamed generation through its old descriptor,
-        // and that file is not safe to tidy however cleanly gamma reopened.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let alphas_own = dir.path().join("alpha-0-err.log");
-        let shared = dir.path().join("shared.log");
-        fs::write(&alphas_own, "x".repeat(2048)).expect("seeded");
-        fs::write(&shared, "x".repeat(2048)).expect("seeded");
-        fs::write(dir.path().join("shared.log.2"), "old\n").expect("seeded");
-        let blocker = dir.path().join("shared.log.1");
-        fs::create_dir(&blocker).expect("blocker");
-        let cleared = blocker.clone();
-        let fake = Fake {
-            on_reopen: Some(Box::new(move |_| {
-                let _ = fs::remove_dir(&cleared);
-            })),
-            ..Fake::new(
-                "max_size = \"1K\"\nnaming = \"numeric\"\nkeep = 1\ncompress = false\n",
-                vec![
-                    sheep("alpha", Some(&alphas_own), Some(&shared)),
-                    sheep("gamma", Some(&shared), None),
-                ],
-            )
-        };
-
-        let (_config, report) = run(&fake, SystemTime::now()).await.expect("ticked");
-
-        assert_eq!(report.rename_failed.len(), 1, "{:?}", report.rename_failed);
-        assert_eq!(
-            *fake.reopened.borrow(),
-            vec!["alpha".to_owned(), "gamma".to_owned()]
-        );
-        assert_eq!(
-            report.rotated, 2,
-            "alpha's own log, then gamma's rename of the shared one"
-        );
-        assert_eq!(
-            fs::read_to_string(dir.path().join("shared.log.1")).expect("gamma's rename"),
-            "x".repeat(2048),
-            "gamma renamed the shared log once the blocker was gone"
-        );
-        assert_eq!(report.deleted, 0, "the shared log is held back from tidy");
-        assert!(
-            dir.path().join("shared.log.4").exists(),
-            "the old generation, shifted twice, is past keep = 1 and still there"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn an_unlistable_directory_under_two_spellings_is_reported_once() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().expect("tempdir");
-        let apis = dir.path().join("api");
-        fs::create_dir(&apis).expect("created");
-        fs::create_dir(apis.join("sub")).expect("created");
-        let api = apis.join("api-0-out.log");
-        let other = apis.join("api-1-out.log");
-        fs::write(&api, "small\n").expect("seeded");
-        fs::write(&other, "small\n").expect("seeded");
-        let long_way = apis.join("sub").join("..").join("api-1-out.log");
-        fs::set_permissions(&apis, fs::Permissions::from_mode(0o311)).expect("chmod");
-        if fs::read_dir(&apis).is_ok() {
-            fs::set_permissions(&apis, fs::Permissions::from_mode(0o755)).expect("chmod back");
-            eprintln!("skipped: this process can list a directory without its read bit");
-            return;
-        }
-        let fake = Fake::new(
-            "max_size = \"1K\"\nmax_age = \"168h\"\n",
-            vec![
-                sheep("api", Some(&api), None),
-                sheep("api-1", Some(&long_way), None),
-            ],
-        );
-
-        let outcome = run(&fake, SystemTime::now()).await;
-        fs::set_permissions(&apis, fs::Permissions::from_mode(0o755)).expect("chmod back");
-        let (_config, report) = outcome.expect("ticked");
-
-        assert_eq!(report.unlistable.len(), 1, "{:?}", report.unlistable);
-    }
-
-    #[test]
-    fn the_summary_counts_a_single_fault_as_once() {
-        let report = Report {
-            rotated: 1,
-            rename_failed: vec!["web-0-out.log: no generation numbers left to rotate into".into()],
-            skipped_protected: 2,
-            ..Report::default()
-        };
-        let line = report.summary().expect("a line");
-        assert!(line.contains("failed once to rename"), "{line}");
-        assert!(line.contains("refused twice to touch"), "{line}");
-        assert!(!line.contains("1 times"), "{line}");
     }
 }

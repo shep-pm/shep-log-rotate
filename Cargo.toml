@@ -32,7 +32,7 @@ integration = []
 # Published 2026-08-26, so the git and branch keys are gone and this resolves
 # from the registry. The lockfile is what proves which source was used.
 #
-# The floor is 0.23.0, the shep this dog is built against. It is
+# The floor is 0.24.0, the shep this dog is built against. It is
 # a raised floor rather than the oldest version that still compiles, and that
 # is a change in what a floor here is for.
 #
@@ -47,7 +47,7 @@ integration = []
 # Protocol is still what a version skew breaks first, and it is not what
 # binds here. A dog announces the `PROTOCOL_VERSION` of the shep-core it was
 # compiled against, and the shepherd refuses a handshake below its own
-# `MIN_SUPPORTED`. 0.23.0 announces 15 and accepts 8, so this dog is still
+# `MIN_SUPPORTED`. 0.24.0 announces 18 and accepts 8, so this dog is still
 # heard by a much older shepherd; what it asks for is not. Its section now
 # goes through `Request::DogConfigResolved`, and a shepherd too old to know
 # that request is answered by the client's own fallback to the plain one, so
@@ -63,6 +63,13 @@ integration = []
 # The older floors, kept because each is still load-bearing and none is
 # visible in a version number:
 #
+# - 0.24.0 first had `#[shep(dog_wide)]`, which is how `interval` says it is
+#   set in `[log-rotate]` only, and `Probe::serves_every_sheep`, which is how
+#   a sheep with no table of its own still rotates on that section. Both are
+#   read by the shepherd off the dog's own answers to `--schema` and
+#   `--shep-manifest`, so a floor below it would publish neither.
+#   `Request::DogSheepSettings`, which a tick asks for every sheep's table,
+#   is older and ships in the 0.23 line.
 # - 0.17.0 first had `dogs::Probe` answer `--shep-manifest`, which is where
 #   a dog declares the permissions above, and first mapped every request to a
 #   permission on the shepherd's side.
@@ -101,7 +108,7 @@ integration = []
 #   `UpDuration`. Before it, a dog borrowing shep's grammars for its config
 #   type needed a second, direct shep-core dependency to turn that feature
 #   on. After it, `shep_client::shep_core` is the only path to these types.
-shep-client = "0.23.0"
+shep-client = "0.24.0"
 # `#[derive(JsonSchema)]` expands to absolute `schemars::` paths, so the
 # crate has to be nameable here even though shep-client already carries it.
 # Same version floor shep itself pins, so this adds an edge and not a crate.
@@ -111,6 +118,10 @@ toml = "0.8"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 jiff = { version = "0.2", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
+# A sheep's table arrives as a `shep_core::config::DogTable`, which is a map
+# of `serde_json::Value`, and layering it over the section means building one
+# from the section's TOML.
+serde_json = { version = "1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tempfile = "3"
@@ -120,10 +131,7 @@ tempfile = "3"
 # replaced. The feature gates shep-client's own `testing` module, which binds a
 # fake shepherd this crate can connect to. Nothing in the shipped binary sees
 # it.
-shep-client = { version = "0.23.0", features = ["test-support"] }
-# The schema tests read the JSON `config_schema` builds, so they need the
-# type it is made of. Nothing in the shipped binary names serde_json.
-serde_json = "1"
+shep-client = { version = "0.24.0", features = ["test-support"] }
 
 [[test]]
 name = "integration"
