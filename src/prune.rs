@@ -1,10 +1,11 @@
 //! Compressing rotated generations, and deleting the ones past `keep`.
 //!
-//! This is the only module in the binary that removes a file. Everything
-//! else renames, writes or reads, so every wrong answer made here is
-//! somebody's evidence missing from the directory they went to look in after
-//! an incident. That asymmetry settles every arguable case on its own: a
-//! generation left behind costs disk, and disk is cheap.
+//! This is the only module in the binary that removes a file, and
+//! [`compress`] is its child: a compression that succeeds ends in
+//! [`remove`]. Everything else renames, writes or reads, so every wrong
+//! answer made here is somebody's evidence missing from the directory they
+//! went to look in after an incident. That asymmetry settles every arguable
+//! case on its own: a generation left behind costs disk, and disk is cheap.
 //!
 //! [`tidy`] runs *after* the reopen, never before. Compressing a large log
 //! is not quick, and doing it first would widen the stretch during which
@@ -14,11 +15,9 @@
 
 use std::{
     collections::BTreeSet,
-    fs, io,
+    fs,
     path::{Path, PathBuf},
 };
-
-use flate2::{Compression, write::GzEncoder};
 
 use crate::{
     config::Config,
@@ -27,6 +26,8 @@ use crate::{
     naming::{LogPath, Order, with_gz},
     rotate::{GenerationFile, generations},
 };
+
+mod compress;
 
 /// What one pass of [`tidy`] did.
 ///
@@ -180,7 +181,7 @@ pub fn tidy(base: &LogPath, config: &Config, protected: &FileSet) -> Result<Tidi
             // A `.gz` already sitting there is the half-written leftover of
             // the crash that made this generation a twin. Replacing it is
             // how the interrupted compression finishes.
-            if let Err(err) = compress(&plain, &target) {
+            if let Err(err) = compress::compress(&plain, &target) {
                 tidied.faults.push(err.to_string());
                 // `compress` creates its target before it writes a byte,
                 // so a fault after that, a full disk say, leaves a partial
@@ -227,85 +228,6 @@ fn is_protected(names: &BTreeSet<String>, path: &Path) -> bool {
         .is_some_and(|name| names.contains(name))
 }
 
-/// Create `target`, empty and already at `permissions`, and hand back the
-/// open handle.
-///
-/// The create is exclusive: `O_EXCL` never follows a symlink, so this is
-/// the one create that cannot be pointed somewhere else by a link planted
-/// at the target's name. Nothing this dog writes is a symlink, so one found
-/// there is somebody else's and is refused. A regular file found there is
-/// the half-written leftover of the crash that made this generation a
-/// twin, and finishing the compression means replacing it: it is removed
-/// and the create runs again, as exclusive as the first, so a link planted
-/// in between is refused too. A check before an ordinary create would
-/// leave that window open.
-///
-/// The permissions go on the handle rather than the path, and in the same
-/// function as the create, because the two have to stay adjacent. A create
-/// opens at `0o666 & !umask`, so a chmod that drifts away from it, down to
-/// the end of a longer function say, leaves a log that is private for a
-/// reason readable by anyone for the entire length of the gzip. On a large
-/// log that is not a short window, and no test can see it: what a test can
-/// check is that the mode is right at the end, which is true either way.
-/// Only the empty file is ever at the creation mode, and the handle keeps
-/// its write access across the change, so a read-only mode still works.
-fn create_with_permissions(target: &Path, permissions: fs::Permissions) -> Result<fs::File, Error> {
-    let file = match create_new(target) {
-        Ok(file) => file,
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-            let found = fs::symlink_metadata(target).map_err(Error::io_at(target))?;
-            if found.file_type().is_symlink() {
-                return Err(Error::io_at(target)(io::Error::other(
-                    "is a symlink, and this dog does not write through one",
-                )));
-            }
-            remove(target)?;
-            create_new(target).map_err(Error::io_at(target))?
-        }
-        Err(err) => return Err(Error::io_at(target)(err)),
-    };
-    file.set_permissions(permissions)
-        .map_err(Error::io_at(target))?;
-    Ok(file)
-}
-
-/// Create `target` for writing, failing if anything is at that name.
-fn create_new(target: &Path) -> io::Result<fs::File> {
-    fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(target)
-}
-
-/// gzip `path` into `target`, then remove `path`.
-///
-/// The order is the whole point. A crash after the write and before the
-/// remove leaves both files, which is the state [`tidy`] recovers from: the
-/// two halves carry the same generation, share one slot, and the plain half
-/// is compressed again over the leftover. Removing first would lose the log
-/// outright.
-///
-/// The `sync_all` puts the compressed bytes on the disk before the unlink is
-/// issued. It does not order the two directory operations against each
-/// other, which would need `base.dir` fsynced as well, so it narrows that
-/// window rather than closing it.
-///
-/// Permissions come across with the bytes, and ahead of them. A log written
-/// 0600 because it carries something private stays 0600 once compressed.
-fn compress(path: &Path, target: &Path) -> Result<(), Error> {
-    let mut source = fs::File::open(path).map_err(Error::io_at(path))?;
-    let permissions = source.metadata().map_err(Error::io_at(path))?.permissions();
-
-    let sink = create_with_permissions(target, permissions)?;
-
-    let mut encoder = GzEncoder::new(sink, Compression::default());
-    io::copy(&mut source, &mut encoder).map_err(Error::io_at(path))?;
-    let sink = encoder.finish().map_err(Error::io_at(target))?;
-    sink.sync_all().map_err(Error::io_at(target))?;
-
-    remove(path)
-}
-
 /// `fs::remove_file`, mapping its error through [`Error::Io`].
 ///
 /// The one line in this binary that destroys data.
@@ -320,9 +242,14 @@ mod tests {
         config::{Config, Naming},
         test_support::{live_log, seed},
     };
-    use std::fs;
+    use flate2::read::GzDecoder;
+    use std::{fs, io::Read, ops::RangeInclusive};
 
-    fn config(naming: Naming, keep: usize, compress: bool) -> Config {
+    /// A section with `naming`, `keep` and `compress` set and the rest at
+    /// its default.
+    ///
+    /// `pub(super)` so `compress`'s own tests can build one too.
+    pub(super) fn config(naming: Naming, keep: usize, compress: bool) -> Config {
         Config {
             naming,
             keep,
@@ -331,16 +258,48 @@ mod tests {
         }
     }
 
+    /// The whole decoded contents of a `.gz` this dog wrote.
+    ///
+    /// `pub(super)` for the same reason as [`config`].
+    pub(super) fn gunzip(path: &Path) -> String {
+        let mut decoded = String::new();
+        GzDecoder::new(fs::File::open(path).expect("open"))
+            .read_to_string(&mut decoded)
+            .expect("decode");
+        decoded
+    }
+
+    /// The name of the dated generation stamped at `second` in these tests'
+    /// fixture logs, `.gz` when `compressed`.
+    fn generation_name(second: u32, compressed: bool) -> String {
+        let name = format!("web-0-out.2026-08-20T15-04-0{second}.log");
+        if compressed {
+            format!("{name}.gz")
+        } else {
+            name
+        }
+    }
+
+    /// That generation sitting in `dir`.
+    fn generation(dir: &Path, second: u32, compressed: bool) -> PathBuf {
+        dir.join(generation_name(second, compressed))
+    }
+
+    /// Seed the dated generations stamped `range`, `body` in each one.
+    fn seed_generations<B: AsRef<[u8]>>(
+        dir: &Path,
+        range: RangeInclusive<u32>,
+        body: impl Fn(u32) -> B,
+    ) {
+        for second in range {
+            seed(dir, generation_name(second, false), body(second));
+        }
+    }
+
     #[test]
     fn the_newest_generation_stays_plain_so_it_is_greppable() {
         let dir = tempfile::tempdir().expect("tempdir");
-        for stamp in ["15-04-05", "15-04-06", "15-04-07"] {
-            seed(
-                dir.path(),
-                format!("web-0-out.2026-08-20T{stamp}.log"),
-                "body\n",
-            );
-        }
+        seed_generations(dir.path(), 5..=7, |_| "body\n");
         let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
         let tidied =
@@ -348,81 +307,30 @@ mod tests {
 
         assert_eq!(tidied.compressed, 2);
         assert!(
-            dir.path()
-                .join("web-0-out.2026-08-20T15-04-07.log")
-                .exists(),
+            generation(dir.path(), 7, false).exists(),
             "newest stays plain"
         );
+        assert!(generation(dir.path(), 6, true).exists());
+        assert!(generation(dir.path(), 5, true).exists());
         assert!(
-            dir.path()
-                .join("web-0-out.2026-08-20T15-04-06.log.gz")
-                .exists()
-        );
-        assert!(
-            dir.path()
-                .join("web-0-out.2026-08-20T15-04-05.log.gz")
-                .exists()
-        );
-        assert!(
-            !dir.path()
-                .join("web-0-out.2026-08-20T15-04-05.log")
-                .exists(),
+            !generation(dir.path(), 5, false).exists(),
             "the plain copy goes"
-        );
-    }
-
-    #[test]
-    fn compression_round_trips_the_bytes() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let body = "line one\nline two\nline three\n";
-        seed(dir.path(), "web-0-out.2026-08-20T15-04-05.log", body);
-        seed(dir.path(), "web-0-out.2026-08-20T15-04-06.log", "newest\n");
-        let base = live_log(dir.path(), "web-0-out.log", "live\n");
-
-        tidy(&base, &config(Naming::Dated, 5, true), &FileSet::default()).expect("tidied");
-
-        let gz =
-            fs::File::open(dir.path().join("web-0-out.2026-08-20T15-04-05.log.gz")).expect("open");
-        let mut out = String::new();
-        std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(gz), &mut out)
-            .expect("decode");
-        assert_eq!(
-            out, body,
-            "a rotator that mangles a log is worse than no rotator"
         );
     }
 
     #[test]
     fn keep_bounds_the_generations_and_deletes_the_oldest() {
         let dir = tempfile::tempdir().expect("tempdir");
-        for second in 1..=6 {
-            seed(
-                dir.path(),
-                format!("web-0-out.2026-08-20T15-04-0{second}.log"),
-                format!("gen{second}\n"),
-            );
-        }
+        seed_generations(dir.path(), 1..=6, |second| format!("gen{second}\n"));
         let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
         let tidied =
             tidy(&base, &config(Naming::Dated, 2, false), &FileSet::default()).expect("tidied");
 
         assert_eq!(tidied.deleted, 4);
-        assert!(
-            dir.path()
-                .join("web-0-out.2026-08-20T15-04-06.log")
-                .exists()
-        );
-        assert!(
-            dir.path()
-                .join("web-0-out.2026-08-20T15-04-05.log")
-                .exists()
-        );
-        assert!(
-            !dir.path()
-                .join("web-0-out.2026-08-20T15-04-04.log")
-                .exists()
-        );
+        assert!(generation(dir.path(), 6, false).exists());
+        assert!(generation(dir.path(), 5, false).exists());
+        assert!(!generation(dir.path(), 4, false).exists());
         assert!(
             dir.path().join("web-0-out.log").exists(),
             "the live file is never a generation"
@@ -432,13 +340,7 @@ mod tests {
     #[test]
     fn pruning_never_deletes_a_file_this_dog_did_not_create() {
         let dir = tempfile::tempdir().expect("tempdir");
-        for second in 1..=6 {
-            seed(
-                dir.path(),
-                format!("web-0-out.2026-08-20T15-04-0{second}.log"),
-                "ours\n",
-            );
-        }
+        seed_generations(dir.path(), 1..=6, |_| "ours\n");
         // Every one of these is a plausible near miss. None was written here.
         let decoys = [
             "web-0-out.2026-08-20.log",
@@ -511,12 +413,8 @@ mod tests {
     #[test]
     fn an_already_compressed_generation_is_not_compressed_twice() {
         let dir = tempfile::tempdir().expect("tempdir");
-        seed(
-            dir.path(),
-            "web-0-out.2026-08-20T15-04-05.log.gz",
-            "already\n",
-        );
-        seed(dir.path(), "web-0-out.2026-08-20T15-04-06.log", "newest\n");
+        seed(dir.path(), generation(dir.path(), 5, true), "already\n");
+        seed(dir.path(), generation(dir.path(), 6, false), "newest\n");
         let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
         let tidied =
@@ -533,24 +431,14 @@ mod tests {
     #[test]
     fn compression_off_leaves_everything_plain() {
         let dir = tempfile::tempdir().expect("tempdir");
-        for stamp in ["15-04-05", "15-04-06"] {
-            seed(
-                dir.path(),
-                format!("web-0-out.2026-08-20T{stamp}.log"),
-                "body\n",
-            );
-        }
+        seed_generations(dir.path(), 5..=6, |_| "body\n");
         let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
         let tidied =
             tidy(&base, &config(Naming::Dated, 5, false), &FileSet::default()).expect("tidied");
 
         assert_eq!(tidied.compressed, 0);
-        assert!(
-            dir.path()
-                .join("web-0-out.2026-08-20T15-04-05.log")
-                .exists()
-        );
+        assert!(generation(dir.path(), 5, false).exists());
     }
 
     #[test]
@@ -599,15 +487,9 @@ mod tests {
         // The same guard with compression off, so nothing but the delete
         // path can be what spares the file.
         let dir = tempfile::tempdir().expect("tempdir");
-        for second in 1..=4 {
-            seed(
-                dir.path(),
-                format!("web-0-out.2026-08-20T15-04-0{second}.log"),
-                format!("gen{second}\n"),
-            );
-        }
+        seed_generations(dir.path(), 1..=4, |second| format!("gen{second}\n"));
         let base = live_log(dir.path(), "web-0-out.log", "live\n");
-        let oldest = dir.path().join("web-0-out.2026-08-20T15-04-01.log");
+        let oldest = generation(dir.path(), 1, false);
         let protected = FileSet::from_paths([oldest.as_path()]);
 
         let tidied = tidy(&base, &config(Naming::Dated, 1, false), &protected).expect("tidied");
@@ -624,10 +506,10 @@ mod tests {
         // same harm as deleting it, so it gets the same refusal and the
         // plain generation is simply left uncompressed.
         let dir = tempfile::tempdir().expect("tempdir");
-        seed(dir.path(), "web-0-out.2026-08-20T15-04-01.log", "ours\n");
-        let live_elsewhere = dir.path().join("web-0-out.2026-08-20T15-04-01.log.gz");
+        seed(dir.path(), generation(dir.path(), 1, false), "ours\n");
+        let live_elsewhere = generation(dir.path(), 1, true);
         fs::write(&live_elsewhere, "somebody is writing here\n").expect("seeded");
-        seed(dir.path(), "web-0-out.2026-08-20T15-04-02.log", "newest\n");
+        seed(dir.path(), generation(dir.path(), 2, false), "newest\n");
         let base = live_log(dir.path(), "web-0-out.log", "live\n");
         let protected = FileSet::from_paths([live_elsewhere.as_path()]);
 
@@ -639,9 +521,7 @@ mod tests {
             "somebody is writing here\n"
         );
         assert!(
-            dir.path()
-                .join("web-0-out.2026-08-20T15-04-01.log")
-                .exists(),
+            generation(dir.path(), 1, false).exists(),
             "and the generation it could not compress stays plain"
         );
         // Two refusals over one file, because that file reaches this module
@@ -660,15 +540,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let elsewhere = dir.path().join("elsewhere.log");
         fs::write(&elsewhere, "somebody else's data\n").expect("seeded");
-        let link = dir.path().join("web-0-out.2026-08-20T15-04-01.log");
+        let link = generation(dir.path(), 1, false);
         std::os::unix::fs::symlink(&elsewhere, &link).expect("linked");
-        for second in 2..=4 {
-            seed(
-                dir.path(),
-                format!("web-0-out.2026-08-20T15-04-0{second}.log"),
-                "ours\n",
-            );
-        }
+        seed_generations(dir.path(), 2..=4, |_| "ours\n");
         let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
         tidy(&base, &config(Naming::Dated, 1, true), &FileSet::default()).expect("tidied");
@@ -682,9 +556,7 @@ mod tests {
             "somebody else's data\n"
         );
         assert!(
-            !dir.path()
-                .join("web-0-out.2026-08-20T15-04-01.log.gz")
-                .exists(),
+            !generation(dir.path(), 1, true).exists(),
             "and it was not compressed through the link"
         );
     }
@@ -692,16 +564,10 @@ mod tests {
     #[test]
     fn a_directory_shaped_like_a_generation_is_never_deleted() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let collision = dir.path().join("web-0-out.2026-08-20T15-04-01.log");
+        let collision = generation(dir.path(), 1, false);
         fs::create_dir(&collision).expect("created");
         fs::write(collision.join("notes.txt"), "an operator's own\n").expect("seeded");
-        for second in 2..=4 {
-            seed(
-                dir.path(),
-                format!("web-0-out.2026-08-20T15-04-0{second}.log"),
-                "ours\n",
-            );
-        }
+        seed_generations(dir.path(), 2..=4, |_| "ours\n");
         let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
         tidy(&base, &config(Naming::Dated, 1, true), &FileSet::default()).expect("tidied");
@@ -711,36 +577,7 @@ mod tests {
             fs::read_to_string(collision.join("notes.txt")).expect("still there"),
             "an operator's own\n"
         );
-        assert!(
-            !dir.path()
-                .join("web-0-out.2026-08-20T15-04-01.log.gz")
-                .exists()
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn compression_keeps_the_source_files_permissions() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let private = dir.path().join("web-0-out.2026-08-20T15-04-01.log");
-        fs::write(&private, "a token, probably\n").expect("seeded");
-        fs::set_permissions(&private, fs::Permissions::from_mode(0o600)).expect("chmod");
-        seed(dir.path(), "web-0-out.2026-08-20T15-04-02.log", "newest\n");
-        let base = live_log(dir.path(), "web-0-out.log", "live\n");
-
-        tidy(&base, &config(Naming::Dated, 5, true), &FileSet::default()).expect("tidied");
-
-        let mode = fs::metadata(dir.path().join("web-0-out.2026-08-20T15-04-01.log.gz"))
-            .expect("the compressed copy")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(
-            mode, 0o600,
-            "a log kept private must not widen when it is compressed"
-        );
+        assert!(!generation(dir.path(), 1, true).exists());
     }
 
     #[test]
@@ -750,14 +587,8 @@ mod tests {
         // keep = 1 both are still pruned: the fault is the one generation's
         // and the pass is not.
         let dir = tempfile::tempdir().expect("tempdir");
-        for second in 1..=3 {
-            seed(
-                dir.path(),
-                format!("web-0-out.2026-08-20T15-04-0{second}.log"),
-                format!("gen{second}\n"),
-            );
-        }
-        let blocker = dir.path().join("web-0-out.2026-08-20T15-04-02.log.gz");
+        seed_generations(dir.path(), 1..=3, |second| format!("gen{second}\n"));
+        let blocker = generation(dir.path(), 2, true);
         fs::create_dir(&blocker).expect("blocker");
         let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
@@ -775,56 +606,10 @@ mod tests {
             "the generation past the fault still compressed"
         );
         assert_eq!(tidied.deleted, 2, "and keep = 1 still pruned both");
-        assert!(
-            dir.path()
-                .join("web-0-out.2026-08-20T15-04-03.log")
-                .exists()
-        );
-        assert!(
-            !dir.path()
-                .join("web-0-out.2026-08-20T15-04-02.log")
-                .exists()
-        );
-        assert!(
-            !dir.path()
-                .join("web-0-out.2026-08-20T15-04-01.log.gz")
-                .exists()
-        );
+        assert!(generation(dir.path(), 3, false).exists());
+        assert!(!generation(dir.path(), 2, false).exists());
+        assert!(!generation(dir.path(), 1, true).exists());
         assert!(blocker.is_dir(), "the blocker is not this dog's to remove");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_symlink_at_the_gz_target_is_refused_not_written_through() {
-        // Somebody planted a link where this generation's archive goes.
-        // Creating the archive through it would truncate and fill whatever
-        // it points at, anywhere on disk.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let elsewhere = seed(dir.path(), "elsewhere.txt", "somebody else's file\n");
-        let plain = seed(dir.path(), "web-0-out.2026-08-20T15-04-01.log", "ours\n");
-        seed(dir.path(), "web-0-out.2026-08-20T15-04-02.log", "newest\n");
-        let link = dir.path().join("web-0-out.2026-08-20T15-04-01.log.gz");
-        std::os::unix::fs::symlink(&elsewhere, &link).expect("linked");
-        let base = live_log(dir.path(), "web-0-out.log", "live\n");
-
-        let tidied =
-            tidy(&base, &config(Naming::Dated, 5, true), &FileSet::default()).expect("tidied");
-
-        assert_eq!(tidied.compressed, 0);
-        assert_eq!(tidied.faults.len(), 1, "{:?}", tidied.faults);
-        assert!(tidied.faults[0].contains("symlink"), "{:?}", tidied.faults);
-        assert_eq!(
-            fs::read_to_string(&elsewhere).expect("untouched"),
-            "somebody else's file\n"
-        );
-        assert!(plain.exists(), "the generation is left plain");
-        assert!(
-            fs::symlink_metadata(&link)
-                .expect("still there")
-                .file_type()
-                .is_symlink(),
-            "and the link is not this dog's to remove"
-        );
     }
 
     #[test]
@@ -845,13 +630,7 @@ mod tests {
     #[test]
     fn keep_larger_than_the_generation_count_deletes_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
-        for second in 1..=3 {
-            seed(
-                dir.path(),
-                format!("web-0-out.2026-08-20T15-04-0{second}.log"),
-                "ours\n",
-            );
-        }
+        seed_generations(dir.path(), 1..=3, |_| "ours\n");
         let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
         let tidied = tidy(
@@ -863,11 +642,7 @@ mod tests {
 
         assert_eq!(tidied.deleted, 0);
         for second in 1..=3 {
-            assert!(
-                dir.path()
-                    .join(format!("web-0-out.2026-08-20T15-04-0{second}.log"))
-                    .exists()
-            );
+            assert!(generation(dir.path(), second, false).exists());
         }
     }
 
@@ -904,33 +679,28 @@ mod tests {
         // finishes what the last one started.
         let dir = tempfile::tempdir().expect("tempdir");
         let body = "the log that nearly got away\n";
-        seed(dir.path(), "web-0-out.2026-08-20T15-04-01.log", body);
+        seed(dir.path(), generation(dir.path(), 1, false), body);
         seed(
             dir.path(),
-            "web-0-out.2026-08-20T15-04-01.log.gz",
+            generation(dir.path(), 1, true),
             "half a gzip stream",
         );
         // A newer generation, so the interrupted pair cannot land on index 0
         // and be spared as "the newest stays plain" whichever order the
         // directory happens to list them in.
-        seed(dir.path(), "web-0-out.2026-08-20T15-04-02.log", "newest\n");
+        seed(dir.path(), generation(dir.path(), 2, false), "newest\n");
         let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
         let tidied =
             tidy(&base, &config(Naming::Dated, 5, true), &FileSet::default()).expect("tidied");
 
         assert_eq!(tidied.compressed, 1, "the plain half, and only it");
-        assert!(
-            !dir.path()
-                .join("web-0-out.2026-08-20T15-04-01.log")
-                .exists()
+        assert!(!generation(dir.path(), 1, false).exists());
+        assert_eq!(
+            gunzip(&generation(dir.path(), 1, true)),
+            body,
+            "the partial stream was replaced, not appended"
         );
-        let gz =
-            fs::File::open(dir.path().join("web-0-out.2026-08-20T15-04-01.log.gz")).expect("open");
-        let mut out = String::new();
-        std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(gz), &mut out)
-            .expect("decode");
-        assert_eq!(out, body, "the partial stream was replaced, not appended");
     }
 
     #[test]
@@ -944,13 +714,13 @@ mod tests {
         // crash, and the module documents recovering from it.
         let dir = tempfile::tempdir().expect("tempdir");
         let body = "the generation that keep = 2 promised to keep\n";
-        seed(dir.path(), "web-0-out.2026-08-20T15-04-01.log", body);
+        seed(dir.path(), generation(dir.path(), 1, false), body);
         seed(
             dir.path(),
-            "web-0-out.2026-08-20T15-04-01.log.gz",
+            generation(dir.path(), 1, true),
             "half a gzip stream",
         );
-        seed(dir.path(), "web-0-out.2026-08-20T15-04-02.log", "newest\n");
+        seed(dir.path(), generation(dir.path(), 2, false), "newest\n");
         let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
         let tidied =
@@ -959,23 +729,19 @@ mod tests {
         assert_eq!(tidied.compressed, 1, "one generation, one compression");
         assert_eq!(tidied.deleted, 0, "two generations, and keep = 2");
         assert!(
-            dir.path()
-                .join("web-0-out.2026-08-20T15-04-02.log")
-                .exists(),
+            generation(dir.path(), 2, false).exists(),
             "the newest survives"
         );
-        let survivor = dir.path().join("web-0-out.2026-08-20T15-04-01.log.gz");
+        let survivor = generation(dir.path(), 1, true);
         assert!(
             survivor.exists(),
             "and so does the older one keep = 2 promised"
         );
-        let mut out = String::new();
-        std::io::Read::read_to_string(
-            &mut flate2::read::GzDecoder::new(fs::File::open(&survivor).expect("open")),
-            &mut out,
-        )
-        .expect("decode");
-        assert_eq!(out, body, "with its bytes, not a leftover partial stream");
+        assert_eq!(
+            gunzip(&survivor),
+            body,
+            "with its bytes, not a leftover partial stream"
+        );
     }
 
     #[test]
@@ -985,13 +751,13 @@ mod tests {
         // `NotFound` and aborts the pass. Every older generation then goes
         // unpruned, on this tick and on every tick after it.
         let dir = tempfile::tempdir().expect("tempdir");
-        seed(dir.path(), "web-0-out.2026-08-20T15-04-01.log", "doomed\n");
+        seed(dir.path(), generation(dir.path(), 1, false), "doomed\n");
         seed(
             dir.path(),
-            "web-0-out.2026-08-20T15-04-01.log.gz",
+            generation(dir.path(), 1, true),
             "half a gzip stream",
         );
-        seed(dir.path(), "web-0-out.2026-08-20T15-04-02.log", "newest\n");
+        seed(dir.path(), generation(dir.path(), 2, false), "newest\n");
         let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
         let tidied = tidy(&base, &config(Naming::Dated, 1, true), &FileSet::default())
@@ -1002,21 +768,9 @@ mod tests {
         // failure is recorded rather than returned now, so the count alone
         // no longer proves the twin was removed once.
         assert!(tidied.faults.is_empty(), "{:?}", tidied.faults);
-        assert!(
-            dir.path()
-                .join("web-0-out.2026-08-20T15-04-02.log")
-                .exists()
-        );
-        assert!(
-            !dir.path()
-                .join("web-0-out.2026-08-20T15-04-01.log")
-                .exists()
-        );
-        assert!(
-            !dir.path()
-                .join("web-0-out.2026-08-20T15-04-01.log.gz")
-                .exists()
-        );
+        assert!(generation(dir.path(), 2, false).exists());
+        assert!(!generation(dir.path(), 1, false).exists());
+        assert!(!generation(dir.path(), 1, true).exists());
     }
 
     #[test]
@@ -1027,11 +781,11 @@ mod tests {
         // it would be the same one generation every time, and one generation
         // is one slot.
         let dir = tempfile::tempdir().expect("tempdir");
-        let plain = dir.path().join("web-0-out.2026-08-20T15-04-01.log");
-        let gz = dir.path().join("web-0-out.2026-08-20T15-04-01.log.gz");
+        let plain = generation(dir.path(), 1, false);
+        let gz = generation(dir.path(), 1, true);
         fs::write(&plain, "doomed\n").expect("seeded");
         fs::write(&gz, "also doomed\n").expect("seeded");
-        seed(dir.path(), "web-0-out.2026-08-20T15-04-02.log", "newest\n");
+        seed(dir.path(), generation(dir.path(), 2, false), "newest\n");
         let base = live_log(dir.path(), "web-0-out.log", "live\n");
 
         let tidied =
@@ -1040,11 +794,7 @@ mod tests {
         assert_eq!(tidied.deleted, 2, "two files, one generation");
         assert!(!plain.exists());
         assert!(!gz.exists(), "no half left behind to leak forever");
-        assert!(
-            dir.path()
-                .join("web-0-out.2026-08-20T15-04-02.log")
-                .exists()
-        );
+        assert!(generation(dir.path(), 2, false).exists());
     }
 
     #[test]
@@ -1055,27 +805,20 @@ mod tests {
         // guard, because the caller believes the file is safe.
         let dir = tempfile::tempdir().expect("tempdir");
         fs::create_dir(dir.path().join("sub")).expect("created");
-        for second in 1..=4 {
-            seed(
-                dir.path(),
-                format!("web-0-out.2026-08-20T15-04-0{second}.log"),
-                format!("gen{second}\n"),
-            );
-        }
+        seed_generations(dir.path(), 1..=4, |second| format!("gen{second}\n"));
         let base = live_log(dir.path(), "web-0-out.log", "live\n");
         let spelled_the_long_way = dir
             .path()
             .join("sub")
             .join("..")
-            .join("web-0-out.2026-08-20T15-04-01.log");
+            .join(generation_name(1, false));
         let protected = FileSet::from_paths([spelled_the_long_way.as_path()]);
 
         let tidied = tidy(&base, &config(Naming::Dated, 1, false), &protected).expect("tidied");
 
         assert_eq!(tidied.skipped_protected, 1);
         assert_eq!(
-            fs::read_to_string(dir.path().join("web-0-out.2026-08-20T15-04-01.log"))
-                .expect("survives"),
+            fs::read_to_string(generation(dir.path(), 1, false)).expect("survives"),
             "gen1\n"
         );
     }
@@ -1092,50 +835,16 @@ mod tests {
         fs::create_dir(&real).expect("created");
         let through = dir.path().join("through");
         std::os::unix::fs::symlink(&real, &through).expect("linked");
-        for second in 1..=4 {
-            seed(
-                &real,
-                format!("web-0-out.2026-08-20T15-04-0{second}.log"),
-                format!("gen{second}\n"),
-            );
-        }
+        seed_generations(&real, 1..=4, |second| format!("gen{second}\n"));
         let base = live_log(&real, "web-0-out.log", "live\n");
-        let protected =
-            FileSet::from_paths([through.join("web-0-out.2026-08-20T15-04-01.log").as_path()]);
+        let protected = FileSet::from_paths([through.join(generation_name(1, false)).as_path()]);
 
         let tidied = tidy(&base, &config(Naming::Dated, 1, false), &protected).expect("tidied");
 
         assert_eq!(tidied.skipped_protected, 1);
         assert_eq!(
-            fs::read_to_string(real.join("web-0-out.2026-08-20T15-04-01.log")).expect("survives"),
+            fs::read_to_string(generation(&real, 1, false)).expect("survives"),
             "gen1\n"
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn compression_narrows_a_stale_gz_left_wide_by_an_earlier_crash() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let private = dir.path().join("web-0-out.2026-08-20T15-04-01.log");
-        fs::write(&private, "a token, probably\n").expect("seeded");
-        fs::set_permissions(&private, fs::Permissions::from_mode(0o600)).expect("chmod");
-        // The half-written `.gz` an earlier crash left, at the mode the
-        // umask happened to give it. Overwriting it must not inherit that.
-        let stale = dir.path().join("web-0-out.2026-08-20T15-04-01.log.gz");
-        fs::write(&stale, "half a gzip stream").expect("seeded");
-        fs::set_permissions(&stale, fs::Permissions::from_mode(0o644)).expect("chmod");
-        seed(dir.path(), "web-0-out.2026-08-20T15-04-02.log", "newest\n");
-        let base = live_log(dir.path(), "web-0-out.log", "live\n");
-
-        tidy(&base, &config(Naming::Dated, 5, true), &FileSet::default()).expect("tidied");
-
-        let mode = fs::metadata(&stale)
-            .expect("the compressed copy")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o600, "the source's mode wins, not the leftover's");
     }
 }
