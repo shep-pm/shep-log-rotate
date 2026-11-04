@@ -756,31 +756,41 @@ mod tests {
         // Spelled in two pieces because the walk includes this file, and a
         // tripwire that fires on its own source can only ever be deleted.
         let forbidden = concat!("Request", "::Flush");
+        //
+        // Each scanned file is recorded by its path under src/, so
+        // `tick/tests/live.rs` and a future `prune/live.rs` stay distinct.
         let mut scanned: Vec<String> = Vec::new();
-        for entry in std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/src")).expect("src") {
-            let path = entry.expect("entry").path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
-                continue;
+        let mut pending = vec![(
+            std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/src")),
+            String::new(),
+        )];
+        while let Some((dir, prefix)) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).expect("a source directory") {
+                let entry = entry.expect("entry");
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let relative = format!("{prefix}{name}");
+                if path.is_dir() {
+                    pending.push((path, format!("{relative}/")));
+                    continue;
+                }
+                if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).expect("read");
+                for (number, line) in source.lines().enumerate() {
+                    assert!(
+                        !line.contains(forbidden),
+                        "{relative}:{}: Flush truncates the log it is asked to settle",
+                        number + 1
+                    );
+                }
+                scanned.push(relative);
             }
-            let source = std::fs::read_to_string(&path).expect("read");
-            for (number, line) in source.lines().enumerate() {
-                assert!(
-                    !line.contains(forbidden),
-                    "{}:{}: Flush truncates the log it is asked to settle",
-                    path.display(),
-                    number + 1
-                );
-            }
-            scanned.push(
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .expect("a source file name")
-                    .to_owned(),
-            );
         }
         assert!(
-            scanned.len() >= 7,
-            "the walk found {} source files, and this crate has 7 or more; \
+            scanned.len() >= 15,
+            "the walk found {} source files, and this crate has 15 or more; \
              a tripwire that scans nothing passes for the wrong reason: {scanned:?}",
             scanned.len()
         );
@@ -788,6 +798,12 @@ mod tests {
             scanned.iter().any(|name| name == "tick.rs"),
             "tick.rs is the only module that builds a Request at all, so a walk \
              that missed it is not watching the file that matters: {scanned:?}"
+        );
+        assert!(
+            scanned.iter().any(|name| name == "tick/tests/live.rs"),
+            "tick/tests/live.rs is the deepest file in the crate, so a walk that \
+             stops recursing leaves every module split into a directory \
+             unwatched: {scanned:?}"
         );
     }
 }
