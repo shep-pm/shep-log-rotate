@@ -159,12 +159,12 @@ in both addresses.
   line says which sheep and which key. The other sheep rotate as usual. A log
   that sheep shares with another sheep is left alone for both, since a sheep
   that is not reopened would go on writing into the renamed file.
-- Two sheep sharing one log path are one log to this dog. The first sheep in
-  the flock's order decides whether it has grown enough to rotate, with its
-  own `max_size` and `max_age`. The sheep that then renames it, normally that
-  same sheep, names the new generation and prunes and compresses the
-  generations by its own `naming`, `keep` and `compress`. The other sheep's
-  settings for that path are not consulted.
+- Two sheep sharing one log path are one log to this dog. It rotates when
+  any of those sheep's own `max_size` or `max_age` says so, whichever order
+  the flock lists them in, and its generations are pruned to the largest
+  `keep` among them, so no sheep loses history it asked for. The sheep that
+  renames it, the first in the flock's order, names the new generation and
+  compresses by its own `naming` and `compress`.
 
 ## The two naming schemes
 
