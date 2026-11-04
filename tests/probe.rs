@@ -23,7 +23,7 @@ use std::process::{Command, Output};
 use shep_client::shep_core::{
     dogs::{
         DOG_WIDE_KEY, MANIFEST_FLAG,
-        manifest::{Manifest, Serves},
+        manifest::{MAX_DESCRIPTION_COLUMNS, MAX_EXAMPLES, Manifest, Serves},
         parse_version_answer,
     },
     protocol::{MIN_SUPPORTED, PROTOCOL_VERSION},
@@ -206,6 +206,56 @@ fn the_manifest_says_this_dog_serves_every_sheep() {
 
     let manifest: Manifest = serde_json::from_str(&stdout(&output)).expect("the answer is JSON");
     assert_eq!(manifest.serves, Serves::EverySheep);
+}
+
+#[test]
+fn the_manifest_declares_a_verb_with_an_example() {
+    // shep draws a dog's help off the manifest `verb`: `shep --help` lists the
+    // dog with `description`, and `shep log-rotate --help` is a page shep
+    // writes from these fields rather than this binary's own output. A dog
+    // that declares nothing gets a stub naming its version, so the only help
+    // an operator reads about this dog is what this test reads back.
+    let output = probe(MANIFEST_FLAG);
+    answered_cleanly(&output, MANIFEST_FLAG);
+
+    let manifest: Manifest = serde_json::from_str(&stdout(&output)).expect("the answer is JSON");
+    let verb = manifest
+        .verb
+        .expect("a dog that declares no verb is drawn as a stub, never as its own help");
+
+    // The literals are the point. A test that compared against a constant this
+    // crate also prints would pass on a description nobody can read.
+    assert_eq!(verb.description, "Rotate each sheep's logs as they grow");
+    assert!(
+        verb.description.chars().count() <= MAX_DESCRIPTION_COLUMNS,
+        "shep's listing has room for {MAX_DESCRIPTION_COLUMNS} columns, and a longer \
+         description is a line no operator sees: {}",
+        verb.description
+    );
+    for dash in ['\u{2014}', '\u{2013}'] {
+        assert!(
+            !verb.description.contains(dash),
+            "shep prints this line in a terminal, where a dash it cannot render lands in \
+             the one line that names the dog: {}",
+            verb.description
+        );
+    }
+
+    // This dog takes no subcommand, so a page shep draws for it names none.
+    assert!(
+        verb.subcommands.is_empty(),
+        "the argument surface is closed, so a declared subcommand is a word shep would \
+         complete to a flag this binary refuses: {:?}",
+        verb.subcommands
+    );
+
+    // Spelled the way shep prints it, `shep` included: shep writes `$ ` in
+    // front of the line and adds nothing else, so an operator can copy it.
+    assert_eq!(verb.examples, ["shep log-rotate --print-config"]);
+    assert!(
+        verb.examples.len() <= MAX_EXAMPLES,
+        "shep draws {MAX_EXAMPLES} examples on a dog's page and warns an adopt past that"
+    );
 }
 
 #[test]
