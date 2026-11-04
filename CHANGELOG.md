@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-11-04
+
+### Changed
+
+- Move Report and its summary line to src/tick/report.rs
+
+
 ## [0.2.5] - 2026-11-04
 
 ### Added
