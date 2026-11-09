@@ -115,7 +115,7 @@ jobs:
     permissions:
       contents: write
       actions: read
-    uses: shep-pm/shep/.github/workflows/dog-release.yml@1b249795a392c8bc4ab361f1cf33731fc079da8e
+    uses: shep-pm/shep/.github/workflows/dog-release.yml@89952a434c44a0842b9f957f7173714beafa1fe9
     with:
       package: shep-log-rotate
       # One crate, so one entry.
@@ -138,7 +138,7 @@ jobs:
     permissions:
       contents: write
       actions: read
-    uses: shep-pm/shep/.github/workflows/dog-release.yml@1b249795a392c8bc4ab361f1cf33731fc079da8e
+    uses: shep-pm/shep/.github/workflows/dog-release.yml@89952a434c44a0842b9f957f7173714beafa1fe9
     with:
       package: shep-log-rotate
       tag: ${{ inputs.dry-run-tag }}
